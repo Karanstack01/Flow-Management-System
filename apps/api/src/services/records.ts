@@ -7,6 +7,7 @@
 import {
   applySystemFields,
   canSeeRecord,
+  computeRecordLifecycle,
   computeTimeline,
   defaultFieldValues,
   editableFieldKeys,
@@ -22,6 +23,7 @@ import {
   visibleFieldKeys,
   type FieldDef,
   type RecordData,
+  type RecordLifecycleStatus,
   type StageState,
 } from '@fms/core';
 import { prisma, Prisma, saveStageStates, toStageStates, type LoadedWorkflow, type Record as RecordRow, type RecordStage, type Tx } from '@fms/db';
@@ -51,6 +53,7 @@ export interface RecordDto {
   currentStageKey: string | null;
   completedAt: string | null;
   archivedAt: string | null;
+  status: RecordLifecycleStatus;
   createdAt: string;
   updatedAt: string;
   version: number;
@@ -72,6 +75,11 @@ export function toDto(wf: LoadedWorkflow, p: AuthUser, row: RowLike, stages: rea
     currentStageKey: row.currentStageKey,
     completedAt: row.completedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
+    status: computeRecordLifecycle({
+      currentStageKey: row.currentStageKey,
+      completedAt: row.completedAt,
+      archivedAt: row.archivedAt,
+    }),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: row.version,

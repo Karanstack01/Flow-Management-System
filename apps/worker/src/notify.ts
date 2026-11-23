@@ -35,6 +35,49 @@ const STALE_PENDING_MS = 10 * 60_000;
 /** Back-off before attempt n+1: 5, 10, 20, 40 minutes. */
 export const retryDelayMs = (attempts: number) => 5 * 60_000 * 2 ** (attempts - 1);
 
+export type NotificationDeliveryStatus = 'pending' | 'sent' | 'failed' | 'skipped' | 'dead';
+
+export interface NotificationStateTransition {
+  allowed: boolean;
+  nextStatus: NotificationDeliveryStatus;
+  reason?: string;
+  delayMs?: number;
+}
+
+/**
+ * Formal state machine transition evaluator for notification delivery lifecycle.
+ */
+export function evaluateNotificationTransition(
+  current: { status: string; attempts: number; updatedAt: Date },
+  event: 'claim' | 'settle_success' | 'settle_fail' | 'reclaim' | 'skip',
+  now = new Date(),
+): NotificationStateTransition {
+  switch (event) {
+    case 'claim':
+      return { allowed: true, nextStatus: 'pending' };
+    case 'settle_success':
+      if (current.status !== 'pending') {
+        return { allowed: false, nextStatus: current.status as NotificationDeliveryStatus, reason: 'Only pending notifications can transition to sent' };
+      }
+      return { allowed: true, nextStatus: 'sent' };
+    case 'settle_fail': {
+      if (current.status !== 'pending') {
+        return { allowed: false, nextStatus: current.status as NotificationDeliveryStatus, reason: 'Only pending notifications can fail' };
+      }
+      const nextStatus = current.attempts >= MAX_ATTEMPTS ? 'dead' : 'failed';
+      return { allowed: true, nextStatus, delayMs: retryDelayMs(current.attempts) };
+    }
+    case 'skip':
+      return { allowed: true, nextStatus: 'skipped' };
+    case 'reclaim': {
+      if (!isRetryable(current, now)) {
+        return { allowed: false, nextStatus: current.status as NotificationDeliveryStatus, reason: 'Notification not currently eligible for retry' };
+      }
+      return { allowed: true, nextStatus: 'pending' };
+    }
+  }
+}
+
 export function isRetryable(row: { status: string; attempts: number; updatedAt: Date }, now = new Date()): boolean {
   const age = now.getTime() - row.updatedAt.getTime();
   if (row.status === 'pending') return age > STALE_PENDING_MS;

@@ -1,5 +1,5 @@
 import { Copy, Plus, Trash2 } from 'lucide-react';
-import { useState, type FormEvent } from 'react';
+import { useReducer, useState, type FormEvent } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
 import type { FieldValue } from '@fms/core';
@@ -7,6 +7,7 @@ import { FieldInput, fieldDefaults } from '../components/FieldInput';
 import { StageIntro } from '../components/StageIntro';
 import { Button, Card, ErrorNote, FormField, PageHeader, Spinner } from '../components/ui';
 import { api, ApiError } from '../lib/api';
+import { formSubmissionReducer, initialFormSubmissionState, isSubmitting } from '../lib/formMachine';
 import { useRecordsInvalidation, useWorkflow } from '../lib/queries';
 import type { FieldView, RecordData, RecordDto } from '../lib/types';
 
@@ -29,9 +30,9 @@ export default function RecordNew() {
     setItems([fieldDefaults(fields.filter((f) => f.lineItem), wf.timezone)]);
     setSeeded(true);
   }
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [submitError, setSubmitError] = useState<unknown>(null);
-  const [busy, setBusy] = useState(false);
+  const [submission, dispatchSubmission] = useReducer(formSubmissionReducer, undefined, initialFormSubmissionState);
+  const { errors, error: submitError } = submission;
+  const busy = isSubmitting(submission);
 
   if (loadError) return <ErrorNote error={loadError} />;
   if (!wf) return <Spinner />;
@@ -44,14 +45,13 @@ export default function RecordNew() {
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    setBusy(true);
-    setErrors({});
-    setSubmitError(null);
+    dispatchSubmission({ type: 'SUBMIT' });
     const pick = (d: RecordData, keys: string[]) => Object.fromEntries(keys.filter((k) => d[k] !== undefined).map((k) => [k, d[k]]));
     try {
       const body = { data: pick(header, editableKeys(headerFields)), ...(itemFields.length ? { items: items.map((it) => pick(it, editableKeys(itemFields))) } : {}) };
       const res = await api<{ records?: RecordDto[]; items?: RecordDto[]; id?: string; number?: number }>(`/workflows/${wf!.key}/records`, { method: 'POST', body });
       invalidate();
+      dispatchSubmission({ type: 'SUCCESS', result: res });
       const recs: RecordDto[] = Array.isArray(res?.records)
         ? res.records
         : Array.isArray(res?.items)
@@ -70,10 +70,8 @@ export default function RecordNew() {
       else toast.success(created);
       navigate(count === 1 && first ? `/w/${wf!.key}/records/${first.id}` : `/w/${wf!.key}`);
     } catch (err) {
-      if (err instanceof ApiError && err.details) setErrors(err.details);
-      setSubmitError(err);
-    } finally {
-      setBusy(false);
+      const details = err instanceof ApiError && err.details ? err.details : undefined;
+      dispatchSubmission({ type: 'ERROR', error: err, errors: details });
     }
   }
 

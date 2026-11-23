@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isRetryable, layout, MAX_ATTEMPTS, splitList, table } from '../src/notify.js';
+import { evaluateNotificationTransition, isRetryable, layout, MAX_ATTEMPTS, splitList, table } from '../src/notify.js';
 import { periodKey } from '../src/jobs/record-changed.js';
 
 describe('notify helpers', () => {
@@ -32,5 +32,37 @@ describe('notify helpers', () => {
     expect(periodKey(undefined, t)).toBe('once');
     expect(periodKey(1, t)).toBe(periodKey(1, new Date('2026-01-22T23:59:59Z')));
     expect(periodKey(1, t)).not.toBe(periodKey(1, new Date('2026-01-23T00:00:01Z')));
+  });
+
+  describe('evaluateNotificationTransition (Notification Delivery Machine)', () => {
+    const now = new Date('2026-11-19T12:00:00Z');
+    it('allows pending -> sent on settle_success', () => {
+      const res = evaluateNotificationTransition({ status: 'pending', attempts: 1, updatedAt: now }, 'settle_success', now);
+      expect(res.allowed).toBe(true);
+      expect(res.nextStatus).toBe('sent');
+    });
+
+    it('rejects settle_success when not pending', () => {
+      const res = evaluateNotificationTransition({ status: 'sent', attempts: 1, updatedAt: now }, 'settle_success', now);
+      expect(res.allowed).toBe(false);
+    });
+
+    it('transitions to failed with backoff when attempts < MAX_ATTEMPTS, or dead when max reached', () => {
+      const fail1 = evaluateNotificationTransition({ status: 'pending', attempts: 1, updatedAt: now }, 'settle_fail', now);
+      expect(fail1.allowed).toBe(true);
+      expect(fail1.nextStatus).toBe('failed');
+      expect(fail1.delayMs).toBe(5 * 60_000);
+
+      const failMax = evaluateNotificationTransition({ status: 'pending', attempts: MAX_ATTEMPTS, updatedAt: now }, 'settle_fail', now);
+      expect(failMax.allowed).toBe(true);
+      expect(failMax.nextStatus).toBe('dead');
+    });
+
+    it('validates retry eligibility on reclaim', () => {
+      const ago5 = new Date(now.getTime() - 5 * 60_000);
+      const ago20 = new Date(now.getTime() - 20 * 60_000);
+      expect(evaluateNotificationTransition({ status: 'failed', attempts: 1, updatedAt: ago5 }, 'reclaim', now).allowed).toBe(false);
+      expect(evaluateNotificationTransition({ status: 'failed', attempts: 1, updatedAt: ago20 }, 'reclaim', now).allowed).toBe(true);
+    });
   });
 });

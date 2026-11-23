@@ -61,3 +61,78 @@ export function saveReducer(state: SaveState, event: SaveEvent): SaveState {
 }
 
 export const canStartSave = (s: SaveState) => s.kind !== 'saving';
+
+// ------------------------------------------------------------------ history (undo / redo)
+export interface HistoryState<T> {
+  past: T[];
+  present: T;
+  future: T[];
+  lastPushedAt: number;
+}
+
+export type HistoryEvent<T> =
+  | { type: 'PUSH'; snapshot: T; coalesce?: boolean; debounceMs?: number }
+  | { type: 'UNDO' }
+  | { type: 'REDO' }
+  | { type: 'RESET'; initial: T };
+
+export const MAX_HISTORY = 80;
+
+export function initHistory<T>(initial: T): HistoryState<T> {
+  return {
+    past: [],
+    present: initial,
+    future: [],
+    lastPushedAt: 0,
+  };
+}
+
+export function historyReducer<T>(state: HistoryState<T>, event: HistoryEvent<T>): HistoryState<T> {
+  switch (event.type) {
+    case 'PUSH': {
+      const now = Date.now();
+      const debounce = event.debounceMs ?? 800;
+      if (event.coalesce && state.past.length > 0 && now - state.lastPushedAt < debounce) {
+        return {
+          ...state,
+          present: event.snapshot,
+          lastPushedAt: now,
+        };
+      }
+      return {
+        past: [...state.past.slice(-(MAX_HISTORY - 1)), state.present],
+        present: event.snapshot,
+        future: [],
+        lastPushedAt: now,
+      };
+    }
+    case 'UNDO': {
+      if (state.past.length === 0) return state;
+      const previous = state.past[state.past.length - 1]!;
+      const newPast = state.past.slice(0, state.past.length - 1);
+      return {
+        past: newPast,
+        present: previous,
+        future: [state.present, ...state.future],
+        lastPushedAt: Date.now(),
+      };
+    }
+    case 'REDO': {
+      if (state.future.length === 0) return state;
+      const next = state.future[0]!;
+      const newFuture = state.future.slice(1);
+      return {
+        past: [...state.past, state.present],
+        present: next,
+        future: newFuture,
+        lastPushedAt: Date.now(),
+      };
+    }
+    case 'RESET': {
+      return initHistory(event.initial);
+    }
+  }
+}
+
+export const canUndo = <T>(state: HistoryState<T>) => state.past.length > 0;
+export const canRedo = <T>(state: HistoryState<T>) => state.future.length > 0;

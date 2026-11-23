@@ -7,6 +7,7 @@ import { effectiveOrgId, prisma } from '@fms/db';
 import type { Config } from '../config.js';
 import { AppError, parse } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
+import { accountSecurityStatus, onLoginFailure, onLoginSuccess } from '../lib/accountSecurity.js';
 import { invalidatePrincipal, ORG_CLOSED_MESSAGE } from '../plugins/auth.js';
 
 const COOKIE = 'fms_rt';
@@ -66,23 +67,24 @@ export default async function authRoutes(app: FastifyInstance, opts: { config: C
       await verify(await DUMMY_HASH_PROMISE, body.password).catch(() => false);
       throw AppError.unauthorized('Invalid email or password');
     }
-    if (user.lockedUntil && user.lockedUntil > new Date()) {
+    const security = accountSecurityStatus(user);
+    if (security.status === 'locked') {
       throw new AppError(423, 'LOCKED', 'Too many failed attempts. Try again later.');
     }
     const ok = await verify(user.passwordHash, body.password).catch(() => false);
     if (!ok) {
-      // A lock that has run out starts a fresh count (otherwise one typo after a lock re-locked at once).
-      const failed = (user.lockedUntil && user.lockedUntil <= new Date() ? 0 : user.failedLogins) + 1;
+      const transition = onLoginFailure(user);
       await prisma.user.update({
         where: { id: user.id },
-        data: { failedLogins: failed, lockedUntil: failed >= MAX_FAILED ? new Date(Date.now() + LOCK_MINUTES * 60_000) : null },
+        data: { failedLogins: transition.failedLogins, lockedUntil: transition.lockedUntil },
       });
       throw AppError.unauthorized('Invalid email or password');
     }
     // Checked only after the password, so a suspended organization does not reveal which emails exist.
     await assertOrgOpen(user);
 
-    await prisma.user.update({ where: { id: user.id }, data: { failedLogins: 0, lockedUntil: null, lastLoginAt: new Date() } });
+    const success = onLoginSuccess();
+    await prisma.user.update({ where: { id: user.id }, data: { ...success, lastLoginAt: new Date() } });
     const accessToken = await issueTokens(reply, user, randomBytes(12).toString('hex'), { ip: req.ip, ua: req.headers['user-agent'] });
     await audit(prisma, { orgId: user.orgId, actor: { userId: user.id, email: user.email }, action: 'auth.login', entityType: 'User', entityId: user.id, ip: req.ip });
     return { accessToken };

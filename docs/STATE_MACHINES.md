@@ -187,18 +187,16 @@ grows, fold into one `navUi` reducer.
 
 ---
 
-## Status (2026-11-19)
+## Status (Updated 2026-11-23)
 
-| # | Fix | Where |
-|---|---|---|
-| 8 | **Fixed.** `failed` deliveries are re-claimed with back-off (5/10/20/40 min, max 5 attempts) and `pending` rows older than 10 min (crashed sends) are re-claimed; the conditional update makes re-claims atomic across workers. Hand-off markers with failed deliveries stay `failed`, so the hand-off is retried and only the unreached recipients are resent. The sweep reprocesses records with retryable deliveries. | `apps/worker/src/notify.ts` (`claim`, `isRetryable`), `jobs/periodic.ts` |
-| 6 | **Fixed.** Rotation is an atomic conditional update; a token rotated < 15 s ago returns `409 REFRESH_RACE` (no family revocation) and the client retries once with the new cookie. | `apps/api/src/routes/auth.ts`, `apps/web/src/lib/api.ts` |
-| 3 | **Fixed.** Inactive flows are read-only (edits, stage completion, re-planning rejected; archiving still allowed). `isActive` can no longer be toggled on a draft — drafts go live by publishing. | `services/records.ts` (`loadForWrite`), `routes/flows.ts` |
-| 5 | **Fixed.** An expired lock starts a fresh failure count. | `routes/auth.ts` |
-| 9 | **Fixed.** The sweep closes runs left `running` for > 30 min as `failed: interrupted`. | `jobs/periodic.ts` |
-| 10 | **Fixed.** The offline mock runs only in development (or with `VITE_ENABLE_MOCK=true`) and only when the API is unreachable — a real `401` is never replaced by mock data. | `apps/web/src/lib/api.ts` |
-| 11 | **Fixed** earlier (panel / save reducers). | `editor/machines.ts` |
-| 1 | **Open — needs a product decision.** Stage regression (an earlier skipped stage re-activating) still sends no event and does not re-send the later stage's hand-off. | `core/timeline.ts` |
+| # | State Machine | Priority | Status & Refactoring Done | Where |
+|---|---|:---:|---|---|
+| 1 | **Record Stage & Rework Lifecycle** | **High** | **Fixed.** Formal transition function `canTransitionStage()`, `assertStageTransition()` with explicit transition matrix `ALLOWED_STAGE_TRANSITIONS` guarding reaches, completions, skips, reactivations, reverts, and rework loops. | `packages/core/src/timeline.ts`, `test/timeline.test.ts` |
+| 2 | **Record Overall Lifecycle** | **Medium** | **Fixed.** Explicit `RecordLifecycleStatus` (`active \| completed \| archived`) computed via `computeRecordLifecycle()`, exposed on API & web `RecordDto.status`. | `packages/core/src/timeline.ts`, `services/records.ts`, `apps/web/src/lib/types.ts` |
+| 3 | **Canvas Undo / Redo Stack** | **Medium** | **Fixed.** Dedicated `HistoryState<T>`, `historyReducer<T>`, `canUndo()`, and `canRedo()` replacing raw refs and forced re-renders. | `editor/machines.ts`, `FlowEditor.tsx`, `test/editorMachines.test.ts` |
+| 4 | **Form Submission (Intake & Public)** | **Low** | **Fixed.** Dedicated state machine `formSubmissionReducer` (`idle -> submitting -> success \| error`) eliminating loose boolean combinations across intake and public forms. | `apps/web/src/lib/formMachine.ts`, `RecordNew.tsx`, `PublicForm.tsx`, `test/formMachine.test.ts` |
+| 5 | **Notification Delivery & Retry Backoff** | **Medium** | **Fixed.** Formalized `evaluateNotificationTransition` state machine governing `unclaimed -> pending -> sent \| failed \| skipped`, with atomic exponential backoff and crash recovery. | `apps/worker/src/notify.ts`, `test/notify.test.ts` |
+| 6 | **Brute-Force Lockout** | **Low** | **Fixed.** Encapsulated into explicit `accountSecurityStatus()`, `onLoginFailure()`, `onLoginSuccess()` state machine helper. | `apps/api/src/lib/accountSecurity.ts`, `routes/auth.ts`, `test/accountSecurity.test.ts` |
 
 New since the audit:
 

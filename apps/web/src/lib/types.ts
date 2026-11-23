@@ -218,6 +218,8 @@ export interface StageDto {
 
 export type RecordData = Record<string, FieldValue | undefined>;
 
+export type RecordLifecycleStatus = 'active' | 'completed' | 'archived';
+
 export interface RecordDto {
   id: string;
   number: number;
@@ -227,6 +229,7 @@ export interface RecordDto {
   currentStageKey: string | null;
   completedAt: string | null;
   archivedAt: string | null;
+  status?: RecordLifecycleStatus;
   createdAt: string;
   updatedAt: string;
   version: number;

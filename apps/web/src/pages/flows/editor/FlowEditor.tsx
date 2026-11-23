@@ -29,7 +29,7 @@ import { useFlowsInvalidation } from '../../../lib/queries';
 import type { EditorData } from '../../../lib/types';
 import { Inspector } from './Inspector';
 import { StepPreview } from './Preview';
-import { canStartSave, PANEL_CLOSED, panelReducer, SAVE_IDLE, saveReducer, type PanelState } from './machines';
+import { canRedo, canStartSave, canUndo, historyReducer, initHistory, PANEL_CLOSED, panelReducer, SAVE_IDLE, saveReducer, type HistoryState, type PanelState } from './machines';
 import { EditorContext, nodeTypes, PALETTE, TONES, type FlowNode } from './nodes';
 
 const MAIN = new Set<CanvasNodeType>(['stage', 'condition', 'timer', 'document']);
@@ -170,21 +170,17 @@ function Editor({ initial }: { initial: EditorData }) {
   const shown = panel.kind !== 'closed' ? panel : lastOpen.current;
   const selectedId = panel.kind === 'node' ? panel.id : null;
 
-  // ---------- undo / redo (structural changes + coalesced edits)
-  const past = useRef<Snapshot[]>([]);
-  const future = useRef<Snapshot[]>([]);
-  const lastPush = useRef(0);
-  const [, force] = useState(0);
+  // ---------- undo / redo history state machine
+  const [history, dispatchHistory] = useReducer(
+    historyReducer<Snapshot>,
+    undefined as any,
+    () => initHistory({ nodes, edges, def }),
+  );
   const snapshot = useCallback((): Snapshot => ({ nodes, edges, def }), [nodes, edges, def]);
   const remember = useCallback(
     (coalesce = false) => {
       dispatchSave({ type: 'EDITED' });
-      const now = Date.now();
-      if (coalesce && now - lastPush.current < 800) return;
-      lastPush.current = now;
-      past.current = [...past.current.slice(-79), snapshot()];
-      future.current = [];
-      force((x) => x + 1);
+      dispatchHistory({ type: 'PUSH', snapshot: snapshot(), coalesce, debounceMs: 800 });
     },
     [snapshot],
   );
@@ -195,18 +191,18 @@ function Editor({ initial }: { initial: EditorData }) {
     dispatchPanel({ type: 'REMOVED', ids: nodes.filter((n) => !s.nodes.some((m) => m.id === n.id)).map((n) => n.id) });
   };
   const undo = () => {
-    const prev = past.current.pop();
+    if (!canUndo(history)) return;
+    const prev = history.past[history.past.length - 1];
     if (!prev) return;
-    future.current.push(snapshot());
+    dispatchHistory({ type: 'UNDO' });
     restore(prev);
-    force((x) => x + 1);
   };
   const redo = () => {
-    const next = future.current.pop();
+    if (!canRedo(history)) return;
+    const next = history.future[0];
     if (!next) return;
-    past.current.push(snapshot());
+    dispatchHistory({ type: 'REDO' });
     restore(next);
-    force((x) => x + 1);
   };
 
   // ---------- live validation
@@ -568,8 +564,8 @@ function Editor({ initial }: { initial: EditorData }) {
             <span className="mx-1 h-5 w-px bg-line" aria-hidden />
             <Button size="sm" variant="ghost" aria-label="Tidy layout" title="Tidy layout" icon={<LayoutGrid className="size-4" />} onClick={tidy} />
             <Button size="sm" variant="ghost" aria-label="Fit to screen" title="Fit to screen" icon={<Maximize2 className="size-4" />} onClick={() => void rf.fitView(FIT)} />
-            <Button size="sm" variant="ghost" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!past.current.length} icon={<Undo2 className="size-4" />} onClick={undo} />
-            <Button size="sm" variant="ghost" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={!future.current.length} icon={<Redo2 className="size-4" />} onClick={redo} />
+            <Button size="sm" variant="ghost" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!canUndo(history)} icon={<Undo2 className="size-4" />} onClick={undo} />
+            <Button size="sm" variant="ghost" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={!canRedo(history)} icon={<Redo2 className="size-4" />} onClick={redo} />
             <Button
               size="sm"
               variant="ghost"

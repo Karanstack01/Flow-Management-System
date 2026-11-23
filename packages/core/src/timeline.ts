@@ -26,6 +26,119 @@ import { normalizeGuard, type RecordData, type StageDef, type SwitchGuard, type 
 
 export type StageStatus = 'waiting' | 'active' | 'done' | 'skipped';
 
+export type StageTransitionAction =
+  | 'reach'
+  | 'complete'
+  | 'skip'
+  | 'reopen'
+  | 'reactivate'
+  | 'revert'
+  | 'noop';
+
+export interface StageTransitionCheck {
+  allowed: boolean;
+  reason?: string;
+}
+
+/** Explicit transition map for stage lifecycle */
+export const ALLOWED_STAGE_TRANSITIONS: Record<StageStatus, readonly StageStatus[]> = {
+  waiting: ['waiting', 'active', 'skipped'],
+  active: ['active', 'done', 'skipped', 'waiting'],
+  done: ['done', 'waiting'], // 'waiting' happens during backward jump / rework
+  skipped: ['skipped', 'active', 'waiting'],
+};
+
+/**
+ * Formal transition guard function for RecordStage lifecycle state machine.
+ * Prevents illegal / impossible transitions across the workflow lifecycle.
+ */
+export function canTransitionStage(
+  from: StageStatus,
+  to: StageStatus,
+  action: StageTransitionAction = 'noop',
+): StageTransitionCheck {
+  if (from === to) return { allowed: true };
+
+  const allowedTargets = ALLOWED_STAGE_TRANSITIONS[from];
+  if (!allowedTargets.includes(to)) {
+    return {
+      allowed: false,
+      reason: `Illegal stage transition from '${from}' to '${to}' (action: ${action})`,
+    };
+  }
+
+  // Guard specific actions
+  switch (action) {
+    case 'complete':
+      if (to !== 'done') {
+        return { allowed: false, reason: `Action 'complete' can only transition to 'done', not '${to}'` };
+      }
+      break;
+    case 'reopen':
+      if (from !== 'done' && from !== 'active' && from !== 'skipped') {
+        return { allowed: false, reason: `Action 'reopen' cannot be applied to stage in '${from}' status` };
+      }
+      if (to !== 'waiting') {
+        return { allowed: false, reason: `Action 'reopen' can only transition to 'waiting', not '${to}'` };
+      }
+      break;
+    case 'revert':
+      if (from !== 'active' && from !== 'skipped') {
+        return { allowed: false, reason: `Action 'revert' can only revert 'active' or 'skipped' stages to 'waiting'` };
+      }
+      if (to !== 'waiting') {
+        return { allowed: false, reason: `Action 'revert' can only transition to 'waiting', not '${to}'` };
+      }
+      break;
+    case 'skip':
+      if (to !== 'skipped') {
+        return { allowed: false, reason: `Action 'skip' can only transition to 'skipped', not '${to}'` };
+      }
+      break;
+    case 'reactivate':
+      if (from !== 'skipped') {
+        return { allowed: false, reason: `Action 'reactivate' can only reactivate 'skipped' stages` };
+      }
+      if (to !== 'active') {
+        return { allowed: false, reason: `Action 'reactivate' can only transition to 'active', not '${to}'` };
+      }
+      break;
+    default:
+      break;
+  }
+
+  return { allowed: true };
+}
+
+export function assertStageTransition(
+  from: StageStatus,
+  to: StageStatus,
+  action: StageTransitionAction = 'noop',
+): void {
+  const check = canTransitionStage(from, to, action);
+  if (!check.allowed) {
+    throw new Error(check.reason);
+  }
+}
+
+/** Record overall lifecycle state */
+export type RecordLifecycleStatus = 'active' | 'completed' | 'archived';
+
+export interface RecordLifecycleInput {
+  currentStageKey?: string | null;
+  completedAt?: Date | string | null;
+  archivedAt?: Date | string | null;
+}
+
+/**
+ * Deterministically computes overall record lifecycle state from timestamps and current stage.
+ */
+export function computeRecordLifecycle(input: RecordLifecycleInput): RecordLifecycleStatus {
+  if (input.archivedAt) return 'archived';
+  if (input.completedAt || !input.currentStageKey) return 'completed';
+  return 'active';
+}
+
 /** A switch guard holds when the first matching case is the one this stage belongs to. */
 export function guardHolds(g: SwitchGuard, data: RecordData): boolean {
   const hit = g.cases.findIndex((c) => evaluateGroup(c, data));
@@ -162,6 +275,9 @@ function pass(input: TimelineInput): TimelineResult {
     else if (status !== 'skipped') blocked = true;
 
     if (status !== prevStatus) {
+      if (prevStatus) {
+        assertStageTransition(prevStatus, status);
+      }
       if (status === 'active') events.push({ type: 'stage_activated', stageKey: stage.key, plannedAt });
       if (status === 'skipped') events.push({ type: 'stage_skipped', stageKey: stage.key });
       if (status === 'done' && index > 0) {
