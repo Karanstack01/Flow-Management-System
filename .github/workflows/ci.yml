@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fms
+          POSTGRES_PASSWORD: fms
+          POSTGRES_DB: fms
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U fms" --health-interval 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://fms:fms@localhost:5432/fms?schema=public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:core
+      - run: npm run db:generate
+      - name: Migrations apply cleanly and match the schema
+        run: |
+          npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
+          npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel packages/db/prisma/schema.prisma --exit-code
+      - name: Seed is idempotent
+        run: npm run seed -w @fms/db && npm run seed -w @fms/db
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build -w @fms/api -w @fms/worker -w @fms/web
+      - run: docker build --target api -t fms-api .

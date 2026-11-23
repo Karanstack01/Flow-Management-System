@@ -1,0 +1,458 @@
+// FMS Platform — PostgreSQL schema
+// Replaces the Google Sheet tabs: Data, Settings, Holiday, Archive, Messages,
+// Table View, audit Log sheet and the DocumentProperties counters.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Tenant. Every business row is scoped to one organization.
+/// Lifecycle and licence are managed by super admins only (legacy: checklicence()).
+model Organization {
+  id               String    @id @default(cuid())
+  name             String
+  slug             String    @unique
+  /// Suspended organizations: nobody but a super admin can sign in, automation pauses.
+  isActive         Boolean   @default(true)
+  suspendedReason  String?
+  /// Licence limits — null means unlimited.
+  maxUsers         Int?
+  maxWorkflows     Int?
+  /// After this instant the organization behaves as suspended.
+  licenseExpiresAt DateTime?
+  createdAt        DateTime  @default(now())
+
+  users       User[]             @relation("OrgMembers")
+  /// Super admins currently working inside this organization.
+  visitors    User[]             @relation("ActiveOrg")
+  groups      Group[]
+  calendars   BusinessCalendar[]
+  workflows   Workflow[]
+  optionSets  OptionSet[]
+  files       FileObject[]
+  auditLogs   AuditLog[]
+  templates   WorkflowTemplate[]
+  connections Connection[]
+}
+
+/// Replaces Settings!X:AC. Passwords are argon2id hashes, never plaintext.
+model User {
+  id           String    @id @default(cuid())
+  orgId        String
+  email        String    @unique
+  name         String
+  phone        String?
+  passwordHash String
+  isActive     Boolean   @default(true)
+  /// ConditionGroup restricting visible records (legacy row filter "col:value").
+  rowFilter    Json?
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  lastLoginAt  DateTime?
+  /// Platform operator. Granted only by another super admin (or the seed / CLI).
+  isSuperAdmin Boolean   @default(false)
+  /// Organization a super admin is currently working in; null = home organization.
+  activeOrgId  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  org           Organization       @relation("OrgMembers", fields: [orgId], references: [id], onDelete: Cascade)
+  activeOrg     Organization?      @relation("ActiveOrg", fields: [activeOrgId], references: [id], onDelete: SetNull)
+  groups        UserGroup[]
+  refreshTokens RefreshToken[]
+  savedViews    SavedView[]
+  favorites     WorkflowFavorite[]
+
+  @@index([orgId])
+  @@index([isSuperAdmin])
+}
+
+/// Replaces the comma-separated group names in Settings!Y. Capabilities replace
+/// the magic groups CREATE / DELETE / RUNSCRIPT.
+model Group {
+  id           String   @id @default(cuid())
+  orgId        String
+  /// Upper-case, referenced by Field.viewGroups/editGroups and Stage.responsibleGroups.
+  name         String
+  description  String?
+  capabilities String[] @default([])
+  createdAt    DateTime @default(now())
+
+  org     Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  members UserGroup[]
+
+  @@unique([orgId, name])
+}
+
+model UserGroup {
+  userId  String
+  groupId String
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@id([userId, groupId])
+}
+
+/// Rotating refresh tokens (stored hashed). Reuse of a revoked token revokes the family.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  family    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([family])
+}
+
+/// Replaces Settings!AF2:AH2 (shift), AF69 (timezone) and the Holiday tab.
+model BusinessCalendar {
+  id         String   @id @default(cuid())
+  orgId      String
+  name       String
+  timezone   String
+  shiftStart String
+  shiftEnd   String
+  /// ISO weekdays that are off (1=Mon … 7=Sun).
+  weeklyOff  Int[]    @default([7])
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  holidays  Holiday[]
+  workflows Workflow[]
+}
+
+model Holiday {
+  id         String @id @default(cuid())
+  calendarId String
+  /// yyyy-MM-dd in the calendar's timezone.
+  date       String
+  name       String
+
+  calendar BusinessCalendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  @@unique([calendarId, date])
+}
+
+/// A process definition (legacy: one whole FMS spreadsheet).
+model Workflow {
+  id            String    @id @default(cuid())
+  orgId         String
+  key           String
+  name          String
+  description   String?
+  /// Validated WorkflowDef (stages + fields) — see @fms/core workflowDefSchema.
+  definition    Json
+  /// Validated WorkflowSettings — reminders, archive, digests, webhooks.
+  settings      Json      @default("{}")
+  version       Int       @default(1)
+  calendarId    String
+  isActive      Boolean   @default(true)
+  /// Being designed: hidden from non-admins, no automation runs.
+  isDraft       Boolean   @default(false)
+  /// Free-text label for grouping on the All Flows page.
+  label         String?
+  /// In the trash (restorable). Trashed flows are hidden and paused.
+  deletedAt     DateTime?
+  createdById   String?
+  /// Node-editor layout (validated Canvas from @fms/core). Null = generated from the definition.
+  canvas        Json?
+  /// Atomic counters (legacy DocumentProperties recordno / submissionid).
+  recordSeq     Int       @default(0)
+  submissionSeq Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  org         Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  calendar    BusinessCalendar   @relation(fields: [calendarId], references: [id])
+  versions    WorkflowVersion[]
+  records     Record[]
+  submissions Submission[]
+  rules       NotificationRule[]
+  views       SavedView[]
+  favorites   WorkflowFavorite[]
+
+  @@unique([orgId, key])
+  @@index([orgId, deletedAt])
+}
+
+/// Settings › Connections: an organization's external services (Cloudinary, Google/Microsoft
+/// mail, RedLava WhatsApp). At most one active connection per kind.
+model Connection {
+  id              String    @id @default(cuid())
+  orgId           String
+  /// storage | email | whatsapp
+  kind            String
+  /// cloudinary | google | microsoft | redlava
+  provider        String
+  isActive        Boolean   @default(false)
+  /// Non-secret settings, validated by @fms/core CONNECTION_SPECS.
+  config          Json      @default("{}")
+  /// AES-256-GCM encrypted JSON of the secret fields. Never returned by the API.
+  secrets         String?
+  lastTestAt      DateTime?
+  lastTestOk      Boolean?
+  lastTestMessage String?
+  updatedById     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, provider])
+  @@index([orgId, kind])
+}
+
+/// Per-user star on the All Flows page.
+model WorkflowFavorite {
+  userId     String
+  workflowId String
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@id([userId, workflowId])
+}
+
+/// Copyable flow blueprint. orgId null = global (built-in or published by a super admin).
+model WorkflowTemplate {
+  id          String   @id @default(cuid())
+  orgId       String?
+  /// Stable key for built-ins (upserted by the seed); null for user-made templates.
+  builtInKey  String?  @unique
+  name        String
+  description String?
+  category    String   @default("General")
+  definition  Json
+  settings    Json     @default("{}")
+  canvas      Json?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+}
+
+/// Immutable history of every published definition.
+model WorkflowVersion {
+  id          String   @id @default(cuid())
+  workflowId  String
+  version     Int
+  definition  Json
+  settings    Json
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowId, version])
+}
+
+/// Groups line-item records created by one multi-item form submission (legacy Submission ID).
+model Submission {
+  id          String   @id @default(cuid())
+  workflowId  String
+  number      Int
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  records  Record[]
+
+  @@unique([workflowId, number])
+}
+
+/// One tracked item (legacy: one row of the Data tab).
+model Record {
+  id              String    @id @default(cuid())
+  orgId           String
+  workflowId      String
+  number          Int
+  submissionId    String?
+  /// Field values keyed by field key.
+  data            Json
+  /// Denormalised: first active stage, null when the flow is finished.
+  currentStageKey String?
+  completedAt     DateTime?
+  createdById     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  archivedAt      DateTime?
+  /// Optimistic concurrency token.
+  version         Int       @default(1)
+
+  workflow   Workflow      @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  submission Submission?   @relation(fields: [submissionId], references: [id], onDelete: SetNull)
+  stages     RecordStage[]
+
+  @@unique([workflowId, number])
+  @@index([workflowId, archivedAt, currentStageKey])
+  @@index([submissionId])
+}
+
+/// Planned / actual time per stage (legacy TS_TAT/TS_MANUAL + TS_Data column pairs).
+model RecordStage {
+  id            String    @id @default(cuid())
+  recordId      String
+  stageKey      String
+  /// waiting | active | done | skipped
+  status        String
+  plannedAt     DateTime?
+  actualAt      DateTime?
+  completedById String?
+  /// Rework round: 0 first time, +1 each time a backward Stage Jump reopens this stage.
+  round         Int       @default(0)
+  updatedAt     DateTime  @updatedAt
+
+  record Record @relation(fields: [recordId], references: [id], onDelete: Cascade)
+
+  @@unique([recordId, stageKey])
+  @@index([stageKey, status, plannedAt])
+}
+
+/// Admin-managed dropdown lists (legacy dropdown_Rng ranges on other tabs).
+model OptionSet {
+  id        String   @id @default(cuid())
+  orgId     String
+  key       String
+  name      String
+  options   String[]
+  updatedAt DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, key])
+}
+
+/// Uploaded attachments (legacy: Drive files shared "anyone with link").
+model FileObject {
+  id              String   @id @default(cuid())
+  orgId           String
+  storageKey      String   @unique
+  /// local | cloudinary — where the bytes live (existing files stay where they were uploaded).
+  storageProvider String   @default("local")
+  /// Provider details needed to read the file back (e.g. Cloudinary resource type and format).
+  storageMeta     Json?
+  originalName    String
+  mimeType        String
+  size            Int
+  sha256          String
+  uploadedById    String?
+  createdAt       DateTime @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+}
+
+/// Saved filters/columns (legacy: JSON in a cell note, and the Table View tab).
+model SavedView {
+  id         String   @id @default(cuid())
+  workflowId String
+  userId     String
+  name       String
+  isShared   Boolean  @default(false)
+  /// { columns: string[], filters: ..., sort: ... }
+  config     Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, userId])
+}
+
+/// Custom notification rule (legacy Messages tab row).
+model NotificationRule {
+  id           String   @id @default(cuid())
+  workflowId   String
+  /// Validated NotificationRuleDef.
+  definition   Json
+  isActive     Boolean  @default(true)
+  /// Set when the rule is owned by a Message node in the flow editor.
+  canvasNodeId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workflow Workflow          @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  logs     NotificationLog[]
+
+  @@unique([workflowId, canvasNodeId])
+}
+
+/// Delivery log + idempotency (replaces "<Rule> Reminder Status" / "Step N Completion Reminder" columns).
+model NotificationLog {
+  id        String   @id @default(cuid())
+  ruleId    String?
+  recordId  String?
+  kind      String
+  channel   String
+  recipient String
+  /// pending → sent | failed | skipped. failed (with attempts left) and stale pending are re-claimed for retry.
+  status    String
+  error     String?
+  dedupeKey String   @unique
+  /// Delivery attempts so far (retries back off: 5, 10, 20, 40 minutes; then it stays failed).
+  attempts  Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  rule NotificationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  @@index([recordId])
+  @@index([createdAt])
+  @@index([status, updatedAt])
+}
+
+/// Append-only audit trail (legacy optional log sheet).
+model AuditLog {
+  id         String   @id @default(cuid())
+  orgId      String
+  actorId    String?
+  actorEmail String?
+  action     String
+  entityType String
+  entityId   String
+  diff       Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, entityType, entityId])
+  @@index([orgId, createdAt])
+}
+
+/// Background job history, visible to admins (legacy "Trigger Active" cells).
+model JobRun {
+  id          String    @id @default(cuid())
+  name        String
+  /// null = scheduled/platform-wide run; set = manual run scoped to one organization.
+  orgId       String?
+  requestedBy String?
+  status      String
+  stats       Json?
+  error       String?
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+
+  @@index([name, startedAt])
+  @@index([orgId, startedAt])
+}

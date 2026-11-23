@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+*.log
+uploads/
+.DS_Store
+.turbo/
+*.tsbuildinfo
+prisma/migrations/dev.db
+prisma/dev.db

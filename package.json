@@ -1,0 +1,33 @@
+{
+  "name": "fms-platform",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Flow Management System — enterprise web platform (React + Fastify + PostgreSQL + BullMQ)",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "tools/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:core": "npm run build -w @fms/core",
+    "build": "npm run build:core && npm run db:generate && npm run build -w @fms/api -w @fms/worker -w @fms/web",
+    "typecheck": "npm run build:core && npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "db:generate": "npm run generate -w @fms/db",
+    "db:migrate": "npm run migrate -w @fms/db",
+    "db:seed": "npm run seed -w @fms/db",
+    "dev:api": "npm run dev -w @fms/api",
+    "dev:worker": "npm run dev -w @fms/worker",
+    "dev:web": "npm run dev -w @fms/web"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "tsx": "4.23.15",
+    "vitest": "3.2.7"
+  }
+}

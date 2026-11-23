@@ -1,0 +1,22 @@
+{
+  "name": "@fms/legacy-import",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Migrates a legacy Google-Sheets FMS (Settings/Data/Archive CSV exports) into the platform",
+  "type": "module",
+  "bin": { "fms-import": "./src/cli.ts" },
+  "scripts": {
+    "convert": "tsx src/cli.ts convert",
+    "load": "tsx --env-file=../../.env src/cli.ts load",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fms/core": "1.0.0",
+    "@fms/db": "1.0.0",
+    "luxon": "3.7.2"
+  },
+  "devDependencies": {
+    "@types/luxon": "3.7.6"
+  }
+}

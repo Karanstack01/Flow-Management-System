@@ -1,0 +1,33 @@
+{
+  "name": "@fms/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "generate": "prisma generate && tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json",
+    "migrate": "prisma migrate deploy",
+    "migrate:dev": "prisma migrate dev",
+    "seed": "tsx --env-file-if-exists=../../.env prisma/seed.ts",
+    "super-admin": "tsx --env-file-if-exists=../../.env prisma/super-admin.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fms/core": "1.0.0",
+    "@node-rs/argon2": "2.2.2",
+    "@prisma/client": "6.19.3",
+    "nodemailer": "10.6.1",
+    "prisma": "6.19.3"
+  },
+  "devDependencies": {
+    "@types/nodemailer": "8.0.2"
+  }
+}

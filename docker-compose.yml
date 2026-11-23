@@ -1,0 +1,84 @@
+# Full stack for local evaluation or a single-node deployment.
+#   cp .env.example .env   (set real secrets)
+#   docker compose up --build
+#   App: http://localhost:8080   Mail inbox: http://localhost:8025
+name: fms
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://fms:${POSTGRES_PASSWORD:-fms}@postgres:5432/fms?schema=public
+  REDIS_URL: redis://redis:6379
+  APP_URL: ${APP_URL:-http://localhost:8080}
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET in .env}
+  # Encrypts Settings › Connections secrets (app passwords, API secrets). Changing it means re-entering them.
+  CONNECTIONS_SECRET_KEY: ${CONNECTIONS_SECRET_KEY:?set CONNECTIONS_SECRET_KEY in .env}
+  CORS_ORIGINS: ${APP_URL:-http://localhost:8080}
+  SMTP_HOST: ${SMTP_HOST:-mailpit}
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASS: ${SMTP_PASS:-}
+  SMTP_FROM: ${SMTP_FROM:-FMS <no-reply@example.com>}
+  WHATSAPP_API_URL: ${WHATSAPP_API_URL:-}
+  WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: fms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fms}
+      POSTGRES_DB: fms
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U fms -d fms']
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports: ['8025:8025']
+
+  migrate:
+    build: { context: ., target: build }
+    environment:
+      <<: *app-env
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@example.com}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe!2026}
+    command: sh -c "npx prisma migrate deploy --schema packages/db/prisma/schema.prisma && npm run seed -w @fms/db"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    build: { context: ., target: api }
+    environment: *app-env
+    volumes: [uploads:/app/uploads]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: { context: ., target: worker }
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  web:
+    build: { context: ., target: web }
+    ports: ['8080:80']
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
