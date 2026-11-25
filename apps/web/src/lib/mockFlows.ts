@@ -20,16 +20,56 @@ import {
 } from '@fms/core';
 import type { DashboardData, EditorData, FlowRow, TemplateSummary, WorkflowSummary, WorkflowView } from './types';
 
+interface MockVersion {
+  version: number;
+  createdAt: string;
+  note: string | null;
+  author: { name: string; email: string } | null;
+  definition: WorkflowDef;
+  settings: WorkflowSettings;
+  canvas: Canvas | null;
+}
+
 interface MockFlow {
   row: FlowRow;
   def: WorkflowDef;
   settings: WorkflowSettings;
   canvas: Canvas | null;
   calendarId: string;
+  versions?: MockVersion[];
 }
 
 const ADMIN = { id: 'usr-admin-01', name: 'Administrator', email: 'admin@example.com' };
 const days = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString();
+const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/**
+ * Demo history: the current definition plus earlier versions that differ a little (owners, a stage
+ * name, holiday sending), so Version history has something to compare.
+ */
+function seedHistory(f: MockFlow): MockVersion[] {
+  const out: MockVersion[] = [];
+  let def = clone(f.def);
+  let settings = clone(f.settings);
+  for (let v = f.row.version; v >= 1; v--) {
+    const at = new Date(new Date(f.row.updatedAt).getTime() - (f.row.version - v) * 2.5 * 86_400_000).toISOString();
+    out.push({ version: v, createdAt: at, note: v === 1 ? 'created' : v === 2 && f.row.status !== 'draft' ? 'published' : 'saved', author: { name: ADMIN.name, email: ADMIN.email }, definition: def, settings, canvas: null });
+    // Step back one version.
+    def = clone(def);
+    settings = clone(settings);
+    const k = (f.row.version - v) % 3;
+    const stage = def.stages[1 + (k % Math.max(1, def.stages.length - 1))];
+    if (k === 0 && stage) stage.responsibleGroups = stage.responsibleGroups.includes('HOD') ? stage.responsibleGroups.filter((g) => g !== 'HOD') : [...stage.responsibleGroups, 'HOD'];
+    if (k === 1 && stage) stage.name = `${stage.name} (draft)`.slice(0, 80);
+    if (k === 2) settings = { ...settings, sendOnHolidays: !settings.sendOnHolidays };
+  }
+  return out;
+}
+
+const versionsOf = (f: MockFlow) => (f.versions ??= seedHistory(f));
+function addVersion(f: MockFlow, note: string) {
+  versionsOf(f).unshift({ version: f.row.version, createdAt: new Date().toISOString(), note, author: { name: ADMIN.name, email: ADMIN.email }, definition: clone(f.def), settings: clone(f.settings), canvas: f.canvas ? clone(f.canvas) : null });
+}
 
 function fromTemplate(templateKey: string, key: string, name: string, extra: Partial<FlowRow>): MockFlow {
   const t = BUILT_IN_TEMPLATES.find((x) => x.key === templateKey)!;
@@ -164,17 +204,23 @@ export function viewOf(key: string): WorkflowView | undefined {
 export function definitionOf(key: string) {
   const f = flows.find((x) => x.row.key === key);
   if (!f) return undefined;
-  return { id: f.row.id, version: f.row.version, calendarId: f.calendarId, isActive: f.row.status !== 'inactive', definition: f.def, settings: f.settings };
+  return { id: f.row.id, version: f.row.version, calendarId: f.calendarId, isActive: f.row.status !== 'inactive', isDraft: f.row.status === 'draft', definition: f.def, settings: f.settings };
 }
 
 export function saveDefinition(key: string, body: { definition?: unknown; settings?: unknown; isActive?: boolean }) {
   const f = find(key);
+  versionsOf(f);
+  if (typeof body.isActive === 'boolean' && f.row.status === 'draft' && !body.isActive) throw new Error('Publish the draft in the flow editor first');
   f.def = workflowDefSchema.parse(body.definition);
   f.settings = workflowSettingsSchema.parse(body.settings ?? f.settings);
   if (typeof body.isActive === 'boolean' && f.row.status !== 'draft') f.row.status = body.isActive ? 'active' : 'inactive';
   f.row.name = f.def.name;
   f.row.version += 1;
   touch(f);
+  const canvas = f.canvas;
+  f.canvas = null;
+  addVersion(f, 'form_editor');
+  f.canvas = canvas;
   return { version: f.row.version };
 }
 
@@ -215,7 +261,7 @@ function connectionView(provider: ConnectionProvider) {
 
 function handleConnections(path: string, method: string, body: Record<string, unknown>): unknown {
   if (path === '/admin/connections') return { items: CONNECTION_PROVIDERS.map(connectionView), cloudinaryFiles: 0 };
-  const m = /^\/admin\/connections\/(cloudinary|google|microsoft|redlava)(?:\/(activate|deactivate|test))?$/.exec(path);
+  const m = /^\/admin\/connections\/(cloudinary|google|microsoft|redlava|anthropic|gsheets)(?:\/(activate|deactivate|test))?$/.exec(path);
   if (!m) return undefined;
   const provider = m[1] as ConnectionProvider;
   const row = mockConnections.get(provider);
@@ -243,8 +289,8 @@ function handleConnections(path: string, method: string, body: Record<string, un
   if (m[2] === 'test') {
     if (!row) throw new Error('Save the settings first');
     const kind = CONNECTION_SPECS[provider].kind;
-    if (kind !== 'storage' && !body.to) throw new Error(kind === 'email' ? 'Enter an email address to send the test to' : 'Enter a WhatsApp number to send the test to');
-    const message = `(mock — nothing was sent) ${kind === 'storage' ? 'Upload, download and delete would be tested against Cloudinary.' : `A test would be sent to ${String(body.to)}.`}`;
+    if ((kind === 'email' || kind === 'whatsapp') && !body.to) throw new Error(kind === 'email' ? 'Enter an email address to send the test to' : 'Enter a WhatsApp number to send the test to');
+    const message = `(mock — nothing was sent) ${kind === 'ai' ? 'A short request would be sent to Claude to check the key.' : kind === 'storage' ? 'Upload, download and delete would be tested against Cloudinary.' : `A test would be sent to ${String(body.to)}.`}`;
     Object.assign(row, { lastTestAt: new Date().toISOString(), lastTestOk: true, lastTestMessage: message });
     return { ok: true, message };
   }
@@ -305,6 +351,16 @@ export function handleFlowsRequest(path: string, method: string, body: Record<st
     return { updated: keys.length };
   }
 
+  const vm = /^\/flows\/([^/]+)\/versions(?:\/(\d+))?$/.exec(path);
+  if (vm && method === 'GET') {
+    const f = find(vm[1]!);
+    const all = versionsOf(f);
+    if (!vm[2]) return { current: f.row.version, items: all.map(({ version, createdAt, note, author }) => ({ version, createdAt, note, author })) };
+    const v = all.find((x) => x.version === Number(vm[2]));
+    if (!v) throw new Error('Version not found');
+    return { ...clone(v), valid: true };
+  }
+
   const m = /^\/flows\/([^/]+)(?:\/(favorite|duplicate|editor|save-as-template))?$/.exec(path);
   if (m) {
     const f = find(m[1]!);
@@ -357,6 +413,8 @@ export function handleFlowsRequest(path: string, method: string, body: Record<st
     if (sub === 'editor' && method === 'PUT') {
       const out = compileCanvas(body.canvas as Canvas, body.definition as WorkflowDef, body.settings as WorkflowSettings);
       if (!out.definition || !out.settings) throw new Error(out.errors[0]?.message ?? 'The flow has problems');
+      versionsOf(f);
+      const wasDraft = f.row.status === 'draft';
       f.def = out.definition;
       f.settings = out.settings;
       f.canvas = body.canvas as Canvas;
@@ -364,6 +422,7 @@ export function handleFlowsRequest(path: string, method: string, body: Record<st
       f.row.version += 1;
       if (body.publish) f.row.status = 'active';
       touch(f);
+      addVersion(f, typeof body.restoredFrom === 'number' ? `restored:${body.restoredFrom}` : body.publish && wasDraft ? 'published' : 'saved');
       return { version: f.row.version, warnings: out.warnings, isDraft: f.row.status === 'draft' };
     }
   }

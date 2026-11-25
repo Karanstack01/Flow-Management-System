@@ -8,6 +8,7 @@ import { evaluateFormula } from './formula.js';
 import { isEmptyValue } from './conditions.js';
 import { checkRule, type RuleContext, type RuleValue } from './rule.js';
 import type { FieldDef, FieldValue, RecordData } from './schema.js';
+export type { FormulaOptions } from './formula.js';
 
 export interface ValidateOptions {
   mode: 'create' | 'update';
@@ -201,7 +202,7 @@ export function defaultFieldValues(fields: readonly FieldDef[], opts: { timezone
 }
 
 /** Fill server-managed fields: computed expressions and the submitting user's email. */
-export function applySystemFields(fields: readonly FieldDef[], data: RecordData, ctx: { userEmail?: string; isCreate: boolean }): RecordData {
+export function applySystemFields(fields: readonly FieldDef[], data: RecordData, ctx: { userEmail?: string; isCreate: boolean; timezone?: string; now?: Date }): RecordData {
   const out: RecordData = { ...data };
   for (const f of fields) {
     if (f.type === 'user-email' && ctx.isCreate && ctx.userEmail) out[f.key] = ctx.userEmail;
@@ -211,9 +212,9 @@ export function applySystemFields(fields: readonly FieldDef[], data: RecordData,
   for (let pass = 0; pass < computed.length; pass++) {
     let changed = false;
     for (const f of computed) {
-      let value: number | null;
+      let value: FieldValue;
       try {
-        value = evaluateFormula(f.expression!, out);
+        value = evaluateFormula(f.expression!, out, { timezone: ctx.timezone, now: ctx.now });
       } catch {
         value = null;
       }

@@ -173,6 +173,18 @@ export async function openFile(fileId: string) {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
+/** An image attachment as an object URL for a thumbnail (cached; the caller never revokes it). */
+const thumbs = new Map<string, Promise<string>>();
+export function fileThumbnail(fileId: string): Promise<string> {
+  let p = thumbs.get(fileId);
+  if (!p) {
+    p = rawRequest(`/files/${fileId}`).then(async (res) => URL.createObjectURL(await res.blob()));
+    p.catch(() => thumbs.delete(fileId));
+    thumbs.set(fileId, p);
+  }
+  return p;
+}
+
 export async function uploadFile(file: File): Promise<{ id: string; name: string; size: number }> {
   const form = new FormData();
   form.append('file', file);

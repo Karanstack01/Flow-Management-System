@@ -7,6 +7,13 @@ export function fmtDateTime(iso: string | null | undefined, zone?: string) {
   return dt.isValid ? dt.toFormat('dd LLL yyyy, HH:mm') : '—';
 }
 
+/** A calendar date in the app's one date format (dd LLL yyyy). */
+export function fmtDate(iso: string | null | undefined, zone?: string) {
+  if (!iso) return '—';
+  const dt = DateTime.fromISO(iso, { zone: zone ?? 'local' });
+  return dt.isValid ? dt.toFormat('dd LLL yyyy') : '—';
+}
+
 export function fmtRelative(iso: string | null | undefined) {
   if (!iso) return '';
   return DateTime.fromISO(iso).toRelative() ?? '';
@@ -37,7 +44,8 @@ export function displayValue(field: Pick<FieldView, 'type'> | undefined, v: unkn
     }
     case 'number':
     case 'computed':
-      return typeof v === 'number' ? fmtNumber(v) : String(v);
+      // A formula may also give text, a date or TRUE / FALSE.
+      return typeof v === 'number' ? fmtNumber(v) : typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v);
     default:
       return typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v);
   }

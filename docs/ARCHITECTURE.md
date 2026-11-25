@@ -135,7 +135,8 @@ How it works:
   * *Public Form Access* (intake only) — `/f/{publicFormId}` without sign-in (`routes/public.ts`): only fields every
     group may edit, no file uploads, rate-limited, record numbers only in the answer. Copies of a flow start private.
   * *Stage Access Control* — `stageAccessRestricted` + `stageUsers` (Viewer / Editor): combined into `fieldAccess` /
-    `visibleFieldKeys` (pass the stages) and checked for completion, planning and document regeneration.
+    `visibleFieldKeys` (pass the stages). Its **Editors replace the owner groups** (`worksOnStage`): they get the
+    hand-off, reminders, digests and My Tasks, and may complete, plan and regenerate the stage.
   * *Stage update options* — **Single item update** off → only the bulk tool (or an admin) edits/completes the stage;
     **Bulk update** on → *Records › select rows › Bulk update* (`POST /workflows/:wf/records/bulk-update`, per-record results).
   * *Thank you message* (intake) — shown after the public form and the New record page.

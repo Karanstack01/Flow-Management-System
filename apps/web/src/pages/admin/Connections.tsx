@@ -1,17 +1,17 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import clsx from 'clsx';
-import { CircleCheck, CircleX, Cloud, ExternalLink, KeyRound, Mail, MessageCircle, Send, ShieldCheck, Trash2 } from 'lucide-react';
+import { CircleCheck, CircleX, Cloud, ExternalLink, KeyRound, Mail, MessageCircle, Send, Sheet, ShieldCheck, Sparkles, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
-import { Badge, Button, ErrorNote, FormField, Input, PageHeader, Select, Spinner } from '../../components/ui';
+import { Badge, Button, ErrorNote, FormField, Input, PageHeader, Select, Spinner, Switch } from '../../components/ui';
 import { ApiError, api } from '../../lib/api';
 import { fmtRelative } from '../../lib/format';
 
-type Provider = 'cloudinary' | 'google' | 'microsoft' | 'redlava';
+type Provider = 'cloudinary' | 'google' | 'microsoft' | 'redlava' | 'anthropic' | 'gsheets';
 
 interface ConnectionView {
   provider: Provider;
-  kind: 'storage' | 'email' | 'whatsapp';
+  kind: 'storage' | 'email' | 'whatsapp' | 'ai' | 'sheets';
   label: string;
   saved: boolean;
   complete: boolean;
@@ -111,6 +111,63 @@ const FIELDS: Record<Provider, FieldSpec[]> = {
     { key: 'defaultLanguage', label: 'Default template language', placeholder: 'en', hint: 'e.g. en, en_US, hi' },
     { key: 'defaultCountryCode', label: 'Default country code', placeholder: '91', hint: 'Added to 10-digit numbers saved without one' },
   ],
+  anthropic: [
+    {
+      key: 'apiKey',
+      label: 'Anthropic API key',
+      secret: true,
+      required: true,
+      placeholder: 'sk-ant-…',
+      hint: (
+        <>
+          Create one at{' '}
+          <a className="inline-flex items-center gap-0.5 text-info underline" href="https://platform.claude.com/settings/keys" target="_blank" rel="noreferrer">
+            platform.claude.com <ExternalLink className="size-3" />
+          </a>
+          . Usage is billed to that Anthropic account.
+        </>
+      ),
+    },
+    {
+      key: 'model',
+      label: 'Model',
+      type: 'select',
+      options: [
+        { value: 'claude-opus-5-5', label: 'Claude Opus 5.5 — best answers (recommended)' },
+        { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 — faster, lower cost' },
+        { value: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 — fastest, lowest cost' },
+      ],
+    },
+    {
+      key: 'effort',
+      label: 'Effort',
+      type: 'select',
+      options: [
+        { value: 'low', label: 'Low — quick summaries' },
+        { value: 'medium', label: 'Medium (recommended)' },
+        { value: 'high', label: 'High — deeper analysis, slower' },
+      ],
+    },
+  ],
+  gsheets: [
+    { key: 'clientEmail', label: 'Service account email', type: 'email', required: true, placeholder: 'fms-export@project.iam.gserviceaccount.com', hint: 'client_email in the JSON key. Share each sheet you export to with this address (Editor).' },
+    {
+      key: 'privateKey',
+      label: 'Private key',
+      secret: true,
+      required: true,
+      placeholder: '-----BEGIN PRIVATE KEY----- …',
+      hint: (
+        <>
+          private_key in the JSON key of a Google Cloud service account with the Sheets API enabled (
+          <a className="inline-flex items-center gap-0.5 text-info underline" href="https://console.cloud.google.com/iam-admin/serviceaccounts" target="_blank" rel="noreferrer">
+            Service accounts <ExternalLink className="size-3" />
+          </a>
+          ).
+        </>
+      ),
+    },
+  ],
 };
 
 const DEFAULTS: Record<Provider, Record<string, string>> = {
@@ -118,6 +175,8 @@ const DEFAULTS: Record<Provider, Record<string, string>> = {
   google: {},
   microsoft: { mode: 'graph' },
   redlava: { authStyle: 'bearer', headerName: 'x-api-key', defaultLanguage: 'en' },
+  anthropic: { model: 'claude-opus-5-5', effort: 'medium' },
+  gsheets: {},
 };
 
 function useConnections() {
@@ -153,7 +212,7 @@ export default function ConnectionsPage() {
 
   return (
     <div className="mx-auto max-w-5xl">
-      <PageHeader title="Connections" subtitle="External services this organization’s flows use for attachments, email and WhatsApp. Secrets are encrypted and never shown again." />
+      <PageHeader title="Connections" subtitle="External services this organization’s flows use for attachments, email, WhatsApp and AI reports. Secrets are encrypted and never shown again." />
       <ErrorNote error={error} />
       {isLoading || !data ? (
         !error && <Spinner />
@@ -237,6 +296,32 @@ export default function ConnectionsPage() {
               offText="Off — WhatsApp uses the server default (if configured)"
             />
           </Section>
+
+          {/* ---------------- AI */}
+          <Section icon={<Sparkles />} title="AI" text="Writes the AI reports set up in each flow’s settings.">
+            <ConnectionCard
+              conn={byProvider.anthropic}
+              onChanged={refresh}
+              toggle
+              intro={
+                <>
+                  AI reports send the <b>fields you choose</b> of the matching records (at most 200 per run) to Anthropic’s Claude with your prompt, and email the answer. Use <b>Test connection</b> to check the key.
+                </>
+              }
+              offText="Off — AI reports are not sent"
+            />
+          </Section>
+
+          {/* ---------------- Google Sheets */}
+          <Section icon={<Sheet />} title="Google Sheets" text="Lets people export filtered records into a Google Sheet tab.">
+            <ConnectionCard
+              conn={byProvider.gsheets}
+              onChanged={refresh}
+              toggle
+              intro={<>Uses a Google <b>service account</b>: share the target spreadsheet with its email as Editor, then use <b>Export › Google Sheet</b> on a records list. The tab is replaced on each export. <b>Test connection</b> checks the sign-in.</>}
+              offText="Off — export to CSV only"
+            />
+          </Section>
         </div>
       )}
     </div>
@@ -262,22 +347,6 @@ function StatusPill({ conn }: { conn: ConnectionView }) {
   if (conn.isActive) return <Badge tone="success">In use</Badge>;
   if (conn.complete) return <Badge>Set up · off</Badge>;
   return <Badge tone="warning">Not set up</Badge>;
-}
-
-function Switch({ checked, onChange, label, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={clsx('relative h-7 w-12 shrink-0 rounded-full transition-colors duration-300 ease-[var(--ease-apple)] disabled:opacity-40', checked ? 'bg-success' : 'bg-line')}
-    >
-      <span className={clsx('absolute top-0.5 size-6 rounded-full bg-white shadow-[0_2px_4px_rgb(0_0_0/0.2)] transition-transform duration-300 ease-[var(--ease-apple)]', checked ? 'translate-x-[22px]' : 'translate-x-0.5')} />
-    </button>
-  );
 }
 
 function ConnectionCard({ conn, onChanged, toggle, intro, offText, testKind }: { conn: ConnectionView; onChanged: () => void; toggle?: boolean; intro?: ReactNode; offText?: string; testKind?: 'email' | 'whatsapp' }) {

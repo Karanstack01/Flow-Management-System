@@ -6,7 +6,7 @@ import clsx from 'clsx';
 import { BookOpen, Braces, ChevronDown, CircleAlert, CircleCheck, Database, FlaskConical, FunctionSquare, Lightbulb, Search, Trash2, UserPlus, Users } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { checkRule, FIELD_TYPES, RULE_EXAMPLES, RULE_FUNCTIONS, RULE_RECORD_VALUES, ruleReferences, RuleError, type FieldDef, type FieldType, type RuleValue, type WorkflowDef } from '@fms/core';
+import { checkRule, DEPENDENT_PARENT_TYPES, dependentsOf, evaluateFormula, FORMULA_FUNCTIONS, formulaError, formulaReferences, parentChoices, sampleRecord, FIELD_TYPES, RULE_EXAMPLES, RULE_FUNCTIONS, RULE_RECORD_VALUES, ruleReferences, RuleError, type FieldDef, type FieldType, type RuleValue, type WorkflowDef } from '@fms/core';
 import { Button, Input, Modal, Select, Textarea } from '../../../components/ui';
 
 export const FIELD_TYPE_LABEL: Record<FieldType, string> = {
@@ -50,9 +50,188 @@ const Label = ({ children }: { children: ReactNode }) => <p className="mb-1.5 te
 function Check({ checked, onChange, children, disabled, title }: { checked: boolean; onChange: (v: boolean) => void; children: ReactNode; disabled?: boolean; title?: string }) {
   return (
     <label className={clsx('inline-flex items-center gap-2 text-sm', disabled ? 'cursor-not-allowed text-muted' : 'cursor-pointer')} title={title}>
-      <input type="checkbox" className="size-4 rounded accent-[var(--color-success)]" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+      <input type="checkbox" className="mt-0.5" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       {children}
     </label>
+  );
+}
+
+/** Formula with live checking, a sample result and the function list (legacy sheet formulas). */
+function FormulaEditor({ field: f, def, onChange }: { field: FieldDef; def: WorkflowDef; onChange: (patch: Partial<FieldDef>) => void }) {
+  const [help, setHelp] = useState(false);
+  const expr = f.expression ?? '';
+  const syntax = expr.trim() ? formulaError(expr) : null;
+  const unknown = !syntax && expr.trim() ? formulaReferences(expr).filter((k) => !def.fields.some((x) => x.key === k)) : [];
+  let sample: string | null = null;
+  if (!syntax && !unknown.length && expr.trim()) {
+    try {
+      const v = evaluateFormula(expr, sampleRecord(def.fields.filter((x) => x.key !== f.key)));
+      sample = v === null ? '(blank)' : String(v);
+    } catch (e) {
+      sample = `Error: ${(e as Error).message}`;
+    }
+  }
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center justify-between">
+        <Label>Formula</Label>
+        <button type="button" className="text-[11px] font-medium text-info hover:underline" onClick={() => setHelp(!help)}>
+          {help ? 'Hide functions' : 'Functions'}
+        </button>
+      </div>
+      <Input className={clsx('font-mono text-[13px]', (syntax || unknown.length) && 'border-danger')} value={expr} placeholder='IF(amount > 50000, "Approval", "Auto")' onChange={(e) => onChange({ expression: e.target.value || undefined })} />
+      {syntax ? (
+        <p className="mt-1 text-[11px] text-danger">{syntax}</p>
+      ) : unknown.length ? (
+        <p className="mt-1 text-[11px] text-danger">Unknown field key{unknown.length > 1 ? 's' : ''}: {unknown.join(', ')}</p>
+      ) : sample !== null ? (
+        <p className="mt-1 text-[11px] text-muted">
+          With sample values: <span className="font-mono text-fg">{sample}</span>
+        </p>
+      ) : (
+        <p className="mt-1 text-[11px] text-muted">Use field keys, numbers, "text", + − × ÷, &amp; to join text, = &lt;&gt; &lt; &gt; to compare, and functions.</p>
+      )}
+      {help && (
+        <div className="mt-2 grid animate-pop-in gap-2 rounded-xl border border-line bg-surface-2/50 p-3 @lg:grid-cols-2">
+          {FORMULA_FUNCTIONS.map((g) => (
+            <div key={g.group}>
+              <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">{g.group}</p>
+              <ul className="space-y-1">
+                {g.items.map((it) => (
+                  <li key={it.name} className="text-[12px]">
+                    <button type="button" className="text-left hover:text-info" title="Use this example" onClick={() => onChange({ expression: it.example })}>
+                      <code className="font-mono font-semibold">{it.name}</code> <span className="text-muted">— {it.hint}</span>
+                      <br />
+                      <code className="font-mono text-[11px] text-muted">{it.example}</code>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          <p className="text-[11px] text-muted @lg:col-span-2">Field keys: {def.fields.filter((x) => x.key !== f.key && x.type !== 'file').map((x) => x.key).join(', ')}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One choice list per parent value: "State" offers Maharashtra, Delhi when "Country" is India. */
+function DependentOptions({ field: f, def, onChange }: { field: FieldDef; def: WorkflowDef; onChange: (patch: Partial<FieldDef>) => void }) {
+  const stageIndex = (k: string) => def.stages.findIndex((s) => s.key === k);
+  // A parent must be a dropdown filled in this stage or earlier, and must not (indirectly) depend on this field.
+  const below = new Set(dependentsOf(def.fields, f.key));
+  const candidates = def.fields.filter((x) => x.key !== f.key && DEPENDENT_PARENT_TYPES.includes(x.type) && stageIndex(x.stageKey) <= stageIndex(f.stageKey) && !below.has(x.key));
+  const parent = def.fields.find((x) => x.key === f.dependsOn);
+  const choices = parentChoices(def.fields, f.dependsOn);
+  const map = f.optionMap ?? {};
+  const orphans = Object.keys(map).filter((k) => !choices.includes(k));
+  const [extra, setExtra] = useState('');
+  const [paste, setPaste] = useState(false);
+  const setRow = (value: string, options: string[] | null) => {
+    const next = { ...map };
+    if (options && options.length) next[value] = options;
+    else delete next[value];
+    onChange({ optionMap: Object.keys(next).length ? next : undefined });
+  };
+  const missing = choices.filter((c) => !map[c]?.length);
+  return (
+    <div className="space-y-3 rounded-xl border border-line bg-surface-2/40 p-3">
+      <div>
+        <Label>Depends on</Label>
+        <Select value={f.dependsOn ?? ''} onChange={(e) => onChange({ dependsOn: e.target.value || undefined })}>
+          <option value="">— Choose the parent field —</option>
+          {candidates.map((x) => (
+            <option key={x.key} value={x.key}>
+              {x.label} · {def.stages.find((s) => s.key === x.stageKey)?.name}
+            </option>
+          ))}
+        </Select>
+        <p className="mt-1 text-[11px] text-muted">
+          A Dropdown (or another Dependent Dropdown, for chains like Country → State → City) in this stage or an earlier one. When it changes, this field is cleared if its value no longer fits.
+        </p>
+        {f.dependsOn && !parent && <p className="mt-1 text-[11px] font-medium text-danger">The parent field no longer exists — choose another.</p>}
+      </div>
+
+      {parent && (
+        <div>
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <Label>Choices for each “{parent.label}” value</Label>
+            <button type="button" className="text-[11px] font-medium text-info hover:underline" onClick={() => setPaste(!paste)}>
+              {paste ? 'Back to the list' : 'Paste many at once'}
+            </button>
+          </div>
+          {paste ? (
+            <>
+              <Textarea
+                className="min-h-28 font-mono text-xs"
+                placeholder={'India: Maharashtra, Delhi\nUAE: Dubai, Abu Dhabi'}
+                defaultValue={Object.entries(map).map(([k, v]) => `${k}: ${v.join(', ')}`).join('\n')}
+                onBlur={(e) => {
+                  const next: Record<string, string[]> = {};
+                  for (const line of e.target.value.split('\n')) {
+                    const i = line.indexOf(':');
+                    if (i > 0 && list(line.slice(i + 1)).length) next[line.slice(0, i).trim()] = list(line.slice(i + 1));
+                  }
+                  onChange({ optionMap: Object.keys(next).length ? next : undefined });
+                }}
+              />
+              <p className="mt-1 text-[11px] text-muted">One line per “{parent.label}” value: <code>Value: choice 1, choice 2</code>. Applied when you leave the box.</p>
+            </>
+          ) : (
+            <div className="space-y-1.5">
+              {choices.length === 0 && <p className="rounded-lg bg-warning-soft px-2.5 py-1.5 text-[12px] text-warning">“{parent.label}” has no options yet — add them to it first{parent.type === 'combobox' ? ', or add a value below' : ''}.</p>}
+              {choices.map((c) => (
+                <ChoiceRow key={c} value={c} options={map[c] ?? []} onChange={(o) => setRow(c, o)} />
+              ))}
+              {parent.type === 'combobox' && (
+                <div className="flex items-center gap-2 pt-1">
+                  <Input className="h-8 text-[13px]" placeholder={`Another “${parent.label}” value`} value={extra} onChange={(e) => setExtra(e.target.value)} />
+                  <Button size="sm" disabled={!extra.trim() || extra.trim() in map} onClick={() => (setRow(extra.trim(), [`Choice for ${extra.trim()}`]), setExtra(''))}>
+                    Add
+                  </Button>
+                </div>
+              )}
+              {missing.length > 0 && choices.length > 0 && (
+                <p className="flex items-start gap-1.5 text-[11px] text-warning">
+                  <CircleAlert className="mt-px size-3.5 shrink-0" />
+                  {missing.length === choices.length ? 'No choices yet' : `No choices for ${missing.map((m) => `“${m}”`).join(', ')}`} — people who pick {missing.length === 1 ? 'it' : 'those'} can not fill in this field.
+                </p>
+              )}
+              {orphans.length > 0 && (
+                <div className="rounded-lg border border-dashed border-line p-2">
+                  <p className="mb-1 text-[11px] font-medium text-muted">Not offered by “{parent.label}” any more (kept for older records):</p>
+                  {orphans.map((o) => (
+                    <p key={o} className="flex items-center gap-2 text-[12px]">
+                      <span className="min-w-0 flex-1 truncate">
+                        <b>{o}</b>: {map[o]!.join(', ')}
+                      </span>
+                      <button type="button" className="text-danger hover:underline" onClick={() => setRow(o, null)}>
+                        Remove
+                      </button>
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChoiceRow({ value, options, onChange }: { value: string; options: string[]; onChange: (o: string[]) => void }) {
+  const saved = options.join(', ');
+  const [text, setText] = useState(saved);
+  useEffect(() => setText(saved), [saved]); // undo / redo
+  return (
+    <div className="grid grid-cols-[minmax(80px,30%)_1fr] items-center gap-2">
+      <span className="truncate rounded-lg bg-surface px-2.5 py-1.5 text-[13px] font-medium ring-1 ring-line" title={value}>
+        {value}
+      </span>
+      <Input className={clsx('h-8 text-[13px]', !options.length && 'border-warning/60')} placeholder="Choice 1, Choice 2" value={text} onChange={(e) => setText(e.target.value)} onBlur={() => text !== saved && onChange(list(text))} />
+    </div>
   );
 }
 
@@ -100,46 +279,8 @@ export function FieldSettings({ field: f, def, isIntake, locked, users, groups, 
           <p className="mt-1 text-[11px] text-muted">Comma separated.</p>
         </div>
       )}
-      {f.type === 'dependent-select' && (
-        <div className="space-y-2">
-          <div>
-            <Label>Depends on</Label>
-            <Select value={f.dependsOn ?? ''} onChange={(e) => onChange({ dependsOn: e.target.value || undefined })}>
-              <option value="">— Choose the parent field —</option>
-              {others
-                .filter((x) => ['select', 'combobox', 'dependent-select'].includes(x.type))
-                .map((x) => (
-                  <option key={x.key} value={x.key}>
-                    {x.label}
-                  </option>
-                ))}
-            </Select>
-          </div>
-          <div>
-            <Label>Options per parent value</Label>
-            <Textarea
-              className="min-h-20 font-mono text-xs"
-              placeholder={'Mumbai: Andheri, Bandra\nDelhi: Saket, Dwarka'}
-              defaultValue={Object.entries(f.optionMap ?? {}).map(([k, v]) => `${k}: ${v.join(', ')}`).join('\n')}
-              onBlur={(e) => {
-                const map: Record<string, string[]> = {};
-                for (const line of e.target.value.split('\n')) {
-                  const i = line.indexOf(':');
-                  if (i > 0) map[line.slice(0, i).trim()] = list(line.slice(i + 1));
-                }
-                onChange({ optionMap: Object.keys(map).length ? map : undefined });
-              }}
-            />
-          </div>
-        </div>
-      )}
-      {f.type === 'computed' && (
-        <div>
-          <Label>Formula</Label>
-          <Input className="font-mono text-[13px]" value={f.expression ?? ''} placeholder="round(qty * rate, 2)" onChange={(e) => onChange({ expression: e.target.value || undefined })} />
-          <p className="mt-1 text-[11px] text-muted">Number field keys with + − × ÷, round(), min(), max(), abs().</p>
-        </div>
-      )}
+      {f.type === 'dependent-select' && <DependentOptions field={f} def={def} onChange={onChange} />}
+      {f.type === 'computed' && <FormulaEditor field={f} def={def} onChange={onChange} />}
 
       <AccessControl field={f} users={users} groups={groups} onChange={onChange} wide={wide} />
 

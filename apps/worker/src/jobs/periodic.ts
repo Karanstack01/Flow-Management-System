@@ -13,12 +13,16 @@ import {
   evaluateGroup,
   notificationRuleSchema,
   recordTitle,
-  stageSummary,
+  resolveTatHours,
+  worksOnStage,
   type RecordData,
 } from '@fms/core';
 import { prisma, Prisma, principalFromUser, saveStageStates, toStageStates } from '@fms/db';
 import { activeWorkflows, fmtTime, isQuietDay, recordUrl, stageRecipients, type JobContext } from '../context.js';
-import { groupMembers, layout, link, MAX_ATTEMPTS, retryDelayMs, send, table } from '../notify.js';
+import { layout, link, MAX_ATTEMPTS, retryDelayMs, send, stageWorkers, table } from '../notify.js';
+import { aiReports } from './ai-reports.js';
+import { handoffBatches } from './handoff-batch.js';
+import { scheduledReport } from './reports.js';
 import { periodKey, processRecord, sendRule } from './record-changed.js';
 
 const BATCH = 500;
@@ -113,7 +117,10 @@ export async function sweep(ctx: JobContext) {
       LIMIT 500`;
     for (const d of due) if (await dispatch(ctx, d.recordId)) retried++;
   }
-  return { recomputed, dispatched, retried };
+
+  // Batched hand-offs ("one message per person") queued since the last run.
+  const batched = await handoffBatches(ctx).catch((e: Error) => (ctx.log.warn({ err: e.message }, 'batched hand-offs failed'), { batches: 0, tasks: 0 }));
+  return { recomputed, dispatched, retried, handoffBatches: batched.batches };
 }
 
 // ------------------------------------------------------------------ reminders
@@ -125,7 +132,14 @@ export async function reminders(ctx: JobContext) {
     if (isQuietDay(wf, now)) continue;
 
     if (wf.settings.upcoming.enabled) {
-      const horizon = wf.calendar.addWorkingHours(now, wf.settings.upcoming.hoursBefore);
+      // Reminder levels (legacy tiers): the first is fixed hours, the others hours or a share of the TAT.
+      const levels = [{ kind: 'hours' as const, value: wf.settings.upcoming.hoursBefore }, ...wf.settings.upcoming.tiers];
+      const maxTat = Math.max(
+        0,
+        ...wf.def.stages.map((st) => (st.planned.mode !== 'tat' ? 0 : st.planned.tat.kind === 'fixed' ? Math.abs(st.planned.tat.hours) : Math.max(st.planned.tat.defaultHours ?? 0, ...Object.values(st.planned.tat.map).map(Math.abs)))),
+      );
+      const window = Math.max(...levels.map((l) => (l.kind === 'hours' ? l.value : (maxTat * l.value) / 100)));
+      const horizon = wf.calendar.addWorkingHours(now, window);
       const due = await prisma.recordStage.findMany({
         where: { status: 'active', plannedAt: { gt: now, lte: horizon }, record: { workflowId: wf.id, archivedAt: null } },
         include: { record: true },
@@ -133,16 +147,27 @@ export async function reminders(ctx: JobContext) {
       });
       for (const s of due) {
         const stage = wf.def.stages.find((x) => x.key === s.stageKey);
-        if (!stage?.responsibleGroups.length) continue;
+        if (!stage || (!stage.responsibleGroups.length && !stage.stageAccessRestricted)) continue;
         const data = s.record.data as RecordData;
+        const left = wf.calendar.workingHoursBetween(now, s.plannedAt!);
+        const tat = stage.planned.mode === 'tat' ? Math.abs(resolveTatHours(stage.planned.tat, data) ?? 0) : 0;
+        // The most urgent level that applies now; earlier, larger levels that were missed are not sent late.
+        let level = -1;
+        let threshold = Infinity;
+        levels.forEach((l, i) => {
+          const hours = l.kind === 'hours' ? l.value : tat ? (tat * l.value) / 100 : -1;
+          if (hours >= 0 && left <= hours && hours < threshold) (level = i), (threshold = hours);
+        });
+        if (level < 0) continue;
         const title = recordTitle(wf.def.fields, data, s.record.number);
         const url = recordUrl(ctx.cfg, wf, s.recordId);
         const subject = `[${wf.name}] Due ${fmtTime(wf, s.plannedAt)} — ${stage.name}: #${s.record.number} ${title}`;
         const r = await send(await ctx.channelsFor(wf.orgId), {
-          key: `upcoming:${s.recordId}:${s.stageKey}:${s.plannedAt!.getTime()}`,
+          // Level 0 keeps the key it always had, so upgrading does not repeat a sent reminder.
+          key: `upcoming:${s.recordId}:${s.stageKey}:${s.plannedAt!.getTime()}${level ? `:l${level}` : ''}`,
           kind: 'upcoming',
           recordId: s.recordId,
-          recipients: await stageRecipients(wf, stage.responsibleGroups, data),
+          recipients: await stageRecipients(wf, stage, data),
           channels: wf.settings.channels,
           subject,
           html: layout('Task due soon', `<p><b>${escapeHtml(stage.name)}</b> for <b>#${s.record.number} ${escapeHtml(title)}</b> is due at <b>${escapeHtml(fmtTime(wf, s.plannedAt))}</b>.</p><p>${link(url, 'Open record')}</p>`),
@@ -176,6 +201,7 @@ export async function digests(ctx: JobContext) {
   const now = new Date();
   let digestsSent = 0;
   let summaries = 0;
+  let aiSent = 0;
   for (const wf of await activeWorkflows(ctx.orgId)) {
     if (isQuietDay(wf, now)) continue;
     const local = DateTime.fromJSDate(now).setZone(wf.calendar.config.timezone);
@@ -188,10 +214,9 @@ export async function digests(ctx: JobContext) {
         orderBy: { plannedAt: 'asc' },
         take: 10_000,
       });
-      const groups = [...new Set(wf.def.stages.flatMap((s) => s.responsibleGroups))];
-      for (const user of await groupMembers(wf.orgId, groups)) {
+      for (const user of await stageWorkers(wf.orgId, wf.def.stages)) {
         const p = principalFromUser(user, wf.orgId);
-        const mineStages = new Set(wf.def.stages.filter((s) => s.responsibleGroups.some((g) => p.groups.includes(g))).map((s) => s.key));
+        const mineStages = new Set(wf.def.stages.filter((s) => worksOnStage(s, p)).map((s) => s.key));
         const tasks = overdue.filter((s) => mineStages.has(s.stageKey) && canSeeRecord(p, s.record.data as RecordData));
         if (!tasks.length) continue;
         const rows = tasks.slice(0, 200).map((s) => {
@@ -214,37 +239,12 @@ export async function digests(ctx: JobContext) {
       }
     }
 
-    const sr = wf.settings.summaryReport;
-    if (sr.enabled && sr.recipients.length && local.hour === sr.hour) {
-      const records = await prisma.record.findMany({ where: { workflowId: wf.id, archivedAt: null }, include: { stages: true }, take: 20_000, orderBy: { number: 'desc' } });
-      const summary = stageSummary(
-        records.map((r) => ({ id: r.id, number: r.number, stages: toStageStates(r.stages) })),
-        wf.def.stages,
-        now,
-        wf.calendar,
-      );
-      const rows = summary.map((s) => [
-        `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${s.color};margin-right:6px"></span>${escapeHtml(s.stageName)}`,
-        String(s.upcoming),
-        `<b style="color:${s.overdue ? '#b91c1c' : 'inherit'}">${s.overdue}</b>`,
-        String(s.doneOnTime),
-        String(s.doneLate),
-        `${s.avgOverdueHours} h`,
-      ]);
-      const subject = `[${wf.name}] Daily stage summary — ${local.toFormat('dd LLL yyyy')}`;
-      const r = await send(await ctx.channelsFor(wf.orgId), {
-        key: `summary:${wf.id}:${day}`,
-        kind: 'summary',
-        recipients: sr.recipients.map((email) => ({ email })),
-        channels: ['email'],
-        subject,
-        html: layout('Stage summary', table(['Stage', 'Upcoming', 'Overdue', 'Done on time', 'Done late', 'Avg delay'], rows)),
-        text: subject,
-      });
-      summaries += r.sent;
-    }
+    // Scheduled reports: up to four times a day, email (with a PDF) and WhatsApp.
+    summaries += await scheduledReport(ctx, wf, now, local).catch((e: Error) => (ctx.log.warn({ workflow: wf.key, err: e.message }, 'scheduled report failed'), 0));
+    // AI reports (every N hours, through the organization's Claude connection).
+    aiSent += await aiReports(ctx, wf, now);
   }
-  return { digestsSent, summaries };
+  return { digestsSent, summaries, aiSent };
 }
 
 // ------------------------------------------------------------------ archive

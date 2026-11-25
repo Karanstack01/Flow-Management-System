@@ -1,5 +1,5 @@
-import { escapeHtml } from '@fms/core';
-import { prisma, Prisma, type WhatsAppMessage } from '@fms/db';
+import { escapeHtml, type StageDef } from '@fms/core';
+import { prisma, Prisma, type MailMessage, type WhatsAppMessage } from '@fms/db';
 import type { Channels } from './channels.js';
 
 export interface Recipient {
@@ -63,6 +63,11 @@ export interface SendSpec {
   text: string;
   /** WhatsApp content; defaults to `text`. Carries an approved template when the rule has one. */
   whatsapp?: WhatsAppMessage;
+  /** Email only: sender name and files to attach. */
+  fromName?: string;
+  attachments?: MailMessage['attachments'];
+  /** The attachments could not be loaded: each email delivery is recorded as failed (and retried). */
+  attachmentError?: string;
 }
 
 export async function send(ch: Channels, spec: SendSpec): Promise<{ sent: number; failed: number }> {
@@ -76,7 +81,8 @@ export async function send(ch: Channels, spec: SendSpec): Promise<{ sent: number
       const id = await claim(`${spec.key}:email:${email}`, { kind: spec.kind, channel: 'email', recipient: email, ruleId: spec.ruleId, recordId: spec.recordId });
       if (!id) continue;
       try {
-        await ch.email({ to: [email], cc: spec.cc, subject: spec.subject, html: spec.html, text: spec.text });
+        if (spec.attachmentError) throw new Error(spec.attachmentError);
+        await ch.email({ to: [email], cc: spec.cc, subject: spec.subject, html: spec.html, text: spec.text, fromName: spec.fromName, attachments: spec.attachments });
         await settle(id);
         sent++;
       } catch (e) {
@@ -111,6 +117,21 @@ export async function groupMembers(orgId: string, groups: readonly string[]) {
   if (!groups.length) return [];
   return prisma.user.findMany({
     where: { orgId, isActive: true, groups: { some: { group: { name: { in: [...groups] } } } } },
+    include: { groups: { include: { group: true } } },
+  });
+}
+
+/**
+ * Active users who may work on any of these stages: owner-group members, plus the assigned
+ * Editors of stages with Stage Access Control (who need not be in a group). Callers narrow
+ * per stage with `worksOnStage`.
+ */
+export async function stageWorkers(orgId: string, stages: readonly Pick<StageDef, 'responsibleGroups' | 'stageAccessRestricted' | 'stageUsers'>[]) {
+  const groups = [...new Set(stages.filter((s) => !s.stageAccessRestricted).flatMap((s) => s.responsibleGroups))];
+  const emails = [...new Set(stages.filter((s) => s.stageAccessRestricted).flatMap((s) => (s.stageUsers ?? []).filter((u) => u.role === 'Editor').map((u) => u.email.toLowerCase())))];
+  if (!groups.length && !emails.length) return [];
+  return prisma.user.findMany({
+    where: { orgId, isActive: true, OR: [...(groups.length ? [{ groups: { some: { group: { name: { in: groups } } } } }] : []), ...(emails.length ? [{ email: { in: emails } }] : [])] },
     include: { groups: { include: { group: true } } },
   });
 }

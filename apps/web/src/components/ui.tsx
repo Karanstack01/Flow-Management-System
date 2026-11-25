@@ -2,21 +2,37 @@ import clsx from 'clsx';
 import { Loader2, X } from 'lucide-react';
 import { forwardRef, useEffect, useRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 
-type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
+type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'soft';
 
-export const Button = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: 'sm' | 'md'; loading?: boolean; icon?: ReactNode }>(
-  function Button({ variant = 'secondary', size = 'md', loading, icon, className, children, disabled, ...rest }, ref) {
+/**
+ * Buttons: a soft top highlight and shadow that lift on hover, press down on click, and a focus ring
+ * for keyboards. The icon swaps to a spinner while `loading`, without the label jumping.
+ */
+export const Button = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: 'xs' | 'sm' | 'md' | 'lg'; loading?: boolean; icon?: ReactNode }>(
+  function Button({ variant = 'secondary', size = 'md', loading, icon, className, children, disabled, type = 'button', ...rest }, ref) {
     return (
       <button
         ref={ref}
+        type={type}
         disabled={disabled || loading}
+        aria-busy={loading || undefined}
         className={clsx(
-          'inline-flex shrink-0 select-none items-center justify-center gap-1.5 rounded-xl font-medium transition-[background-color,box-shadow,transform,opacity,color] duration-200 ease-[var(--ease-apple)] active:scale-[0.97] disabled:pointer-events-none disabled:opacity-45 [&_svg]:shrink-0',
-          size === 'sm' ? 'h-8 px-3 text-[13px]' : 'h-10 px-4 text-sm',
-          variant === 'primary' && 'bg-primary text-primary-fg shadow-[0_1px_2px_rgb(0_0_0/0.12)] hover:opacity-[0.88]',
-          variant === 'secondary' && 'border border-line bg-surface text-fg shadow-[0_1px_1px_rgb(0_0_0/0.03)] hover:bg-surface-2',
-          variant === 'ghost' && 'text-muted hover:bg-surface-2 hover:text-fg',
-          variant === 'danger' && 'bg-danger text-white hover:opacity-90',
+          'relative inline-flex shrink-0 select-none items-center justify-center gap-1.5 whitespace-nowrap font-medium outline-none',
+          'transition-[background-color,border-color,box-shadow,transform,opacity,color] duration-200 ease-[var(--ease-apple)]',
+          'enabled:active:scale-[0.97] enabled:active:duration-75',
+          variant !== 'ghost' && 'enabled:hover:-translate-y-px enabled:active:translate-y-0',
+          'focus-visible:shadow-[0_0_0_3px_var(--color-surface),0_0_0_5px_rgb(0_102_204/0.55)]',
+          'disabled:cursor-not-allowed disabled:opacity-45 [&_svg]:shrink-0 [&_svg]:transition-transform [&_svg]:duration-200',
+          size === 'xs' && 'h-7 gap-1 rounded-lg px-2.5 text-xs [&_svg]:size-3.5',
+          size === 'sm' && 'h-8 rounded-[10px] px-3 text-[13px]',
+          size === 'md' && 'h-10 rounded-xl px-4 text-sm',
+          size === 'lg' && 'h-12 rounded-2xl px-5 text-[15px]',
+          variant === 'primary' &&
+            'bg-primary text-primary-fg shadow-[inset_0_1px_0_rgb(255_255_255/0.14),0_1px_2px_rgb(0_0_0/0.16),0_2px_6px_rgb(0_0_0/0.08)] enabled:hover:shadow-[inset_0_1px_0_rgb(255_255_255/0.14),0_4px_14px_rgb(0_0_0/0.18)] enabled:hover:opacity-[0.92]',
+          variant === 'secondary' && 'border border-line bg-surface text-fg shadow-[0_1px_2px_rgb(0_0_0/0.05)] enabled:hover:border-muted/35 enabled:hover:bg-surface-2/70 enabled:hover:shadow-[0_3px_10px_rgb(0_0_0/0.07)]',
+          variant === 'soft' && 'bg-surface-2 text-fg enabled:hover:bg-line/70',
+          variant === 'ghost' && 'text-muted enabled:hover:bg-surface-2 enabled:hover:text-fg',
+          variant === 'danger' && 'bg-danger text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18),0_1px_2px_rgb(0_0_0/0.16)] enabled:hover:shadow-[0_4px_14px_rgb(215_0_21/0.3)] enabled:hover:opacity-95',
           className,
         )}
         {...rest}
@@ -27,6 +43,19 @@ export const Button = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLBut
     );
   },
 );
+
+/** Checkbox with a label; the box itself is styled app-wide (index.css), so plain inputs match it. */
+export function Checkbox({ checked, onChange, label, hint, disabled, className }: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode; hint?: ReactNode; disabled?: boolean; className?: string }) {
+  return (
+    <label className={clsx('group flex cursor-pointer items-start gap-2.5 text-sm', disabled && 'cursor-not-allowed opacity-60', className)}>
+      <input type="checkbox" className="mt-0.5" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+      <span className="min-w-0">
+        <span className="block">{label}</span>
+        {hint && <span className="mt-0.5 block text-xs text-muted">{hint}</span>}
+      </span>
+    </label>
+  );
+}
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...rest }, ref) {
   return <input ref={ref} className={clsx('input', className)} {...rest} />;
@@ -57,8 +86,11 @@ export function FormField({ label, error, hint, required, children, className }:
   );
 }
 
-/** On/off switch (green when on). */
-export function Switch({ checked, onChange, label, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean }) {
+/**
+ * On/off switch (green when on). The knob glides with a slight spring, stretches while pressed
+ * (like iOS), and the track colour cross-fades.
+ */
+export function Switch({ checked, onChange, label, disabled, size = 'md' }: { checked: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean; size?: 'sm' | 'md' }) {
   return (
     <button
       type="button"
@@ -67,12 +99,10 @@ export function Switch({ checked, onChange, label, disabled }: { checked: boolea
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={clsx(
-        'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 ease-[var(--ease-apple)] disabled:opacity-45',
-        checked ? 'bg-success' : 'bg-line',
-      )}
+      data-size={size}
+      className={clsx('switch group', checked && 'is-on')}
     >
-      <span className={clsx('inline-block size-5 rounded-full bg-white shadow-[0_1px_3px_rgb(0_0_0/0.25)] transition-transform duration-200 ease-[var(--ease-apple)]', checked ? 'translate-x-[22px]' : 'translate-x-0.5')} />
+      <span className="switch-knob" aria-hidden />
     </button>
   );
 }

@@ -17,6 +17,7 @@ import fileRoutes from './routes/files.js';
 import platformRoutes from './routes/platform.js';
 import flowRoutes from './routes/flows.js';
 import connectionRoutes from './routes/connections.js';
+import dashboardTileRoutes from './routes/dashboard-tiles.js';
 import recordRoutes from './routes/records.js';
 import workflowRoutes from './routes/workflows.js';
 
@@ -77,6 +78,7 @@ export async function buildApp(config: Config, deps: { storage?: Storage } = {})
       await v1.register(platformRoutes);
       await v1.register(flowRoutes);
       await v1.register(connectionRoutes);
+      await v1.register(dashboardTileRoutes);
       // No sign-in: the public intake form (only for flows that switch it on).
       await v1.register(publicRoutes);
     },

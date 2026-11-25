@@ -43,6 +43,8 @@ interface Loaded {
   version: number;
   calendarId: string;
   isActive: boolean;
+  /** Drafts go live by publishing in the flow editor; they have no active / inactive switch. */
+  isDraft?: boolean;
   definition: WorkflowDef;
   settings: WorkflowSettings;
 }
@@ -138,11 +140,11 @@ function Editor({ initial, onCreated }: { initial: Loaded | null; onCreated?: (k
     setBusy(true);
     try {
       if (initial) {
-        const r = await api<{ version: number }>(`/workflows/${def.key}/definition`, { method: 'PUT', body: { definition: def, settings, calendarId, isActive } });
-        toast.success(`Published version ${r.version}`);
+        const r = await api<{ version: number }>(`/workflows/${def.key}/definition`, { method: 'PUT', body: { definition: def, settings, calendarId, ...(initial.isDraft ? {} : { isActive }) } });
+        toast.success(initial.isDraft ? `Draft saved (version ${r.version})` : `Published version ${r.version}`, initial.isDraft ? { description: 'Publish it in the flow editor to make it live.' } : undefined);
       } else {
         await api('/workflows', { method: 'POST', body: { definition: def, settings, calendarId } });
-        toast.success('Workflow created');
+        toast.success('Workflow created as a draft', { description: 'Publish it in the flow editor to make it live.' });
         onCreated?.(def.key);
       }
       void qc.invalidateQueries();
@@ -174,10 +176,16 @@ function Editor({ initial, onCreated }: { initial: Loaded | null; onCreated?: (k
             </Select>
           </FormField>
           <FormField label="Status">
-            <Select value={isActive ? '1' : '0'} onChange={(e) => setIsActive(e.target.value === '1')} disabled={!initial}>
-              <option value="1">Active</option>
-              <option value="0">Inactive (read-only)</option>
-            </Select>
+            {!initial || initial.isDraft ? (
+              <Select value="draft" disabled aria-label="Status">
+                <option value="draft">Draft — publish in the flow editor</option>
+              </Select>
+            ) : (
+              <Select value={isActive ? '1' : '0'} onChange={(e) => setIsActive(e.target.value === '1')}>
+                <option value="1">Active</option>
+                <option value="0">Inactive (read-only)</option>
+              </Select>
+            )}
           </FormField>
           <FormField label="Description" className="md:col-span-4">
             <Input value={def.description ?? ''} onChange={(e) => setDef({ ...def, description: e.target.value || undefined })} />
@@ -197,7 +205,7 @@ function Editor({ initial, onCreated }: { initial: Loaded | null; onCreated?: (k
           ]}
         />
         <Button variant="primary" icon={<UploadCloud className="size-4" />} disabled={issues.length > 0} loading={busy} onClick={() => void publish()}>
-          {initial ? `Publish v${initial.version + 1}` : 'Create workflow'}
+          {!initial ? 'Create draft' : initial.isDraft ? `Save draft v${initial.version + 1}` : `Publish v${initial.version + 1}`}
         </Button>
       </div>
 
@@ -543,7 +551,7 @@ function SettingsEditor({ settings: s, onChange, fields }: { settings: WorkflowS
       </Card>
       <Card title="Task notifications">
         <div className="space-y-3">
-          {toggle('Notify owners when a stage becomes active (hand-off)', s.handoff.enabled, (v) => onChange({ ...s, handoff: { enabled: v } }))}
+          {toggle('Notify owners when a stage becomes active (hand-off)', s.handoff.enabled, (v) => onChange({ ...s, handoff: { ...s.handoff, enabled: v } }))}
           <div className="flex flex-wrap items-center gap-2">
             {toggle('Remind before due — working hours:', s.upcoming.enabled, (v) => onChange({ ...s, upcoming: { ...s.upcoming, enabled: v } }))}
             <Input type="number" className="w-24" min={0} value={s.upcoming.hoursBefore} onChange={(e) => onChange({ ...s, upcoming: { ...s.upcoming, hoursBefore: Number(e.target.value) } })} />

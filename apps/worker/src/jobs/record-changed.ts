@@ -15,7 +15,7 @@ import {
   type RecordData,
   type StageState,
 } from '@fms/core';
-import { BlockedUrlError, guardedFetch, prisma, roundSuffix, toStageStates, type LoadedWorkflow, type Record as RecordRow } from '@fms/db';
+import { BlockedUrlError, guardedFetch, loadAttachments, prisma, roundSuffix, toStageStates, type LoadedWorkflow, type MailMessage, type Record as RecordRow } from '@fms/db';
 import { fmtTime, recordUrl, stageRecipients, workflowById, type JobContext } from '../context.js';
 import { claim, layout, link, MAX_ATTEMPTS, send, splitList, table } from '../notify.js';
 
@@ -48,7 +48,12 @@ async function handoffs(ctx: JobContext, wf: LoadedWorkflow, row: RecordRow, sta
     // Marker claim: one hand-off per (record, stage), even with zero recipients.
     const marker = await claim(`handoff:${row.id}:${stage.key}${roundSuffix(state.round)}`, { kind: 'handoff-marker', channel: 'none', recipient: '*', recordId: row.id });
     if (!marker) continue;
-    const recipients = await stageRecipients(wf, stage.responsibleGroups, data);
+    // "One message per person": queue it; the sweep sends each person one list of their new tasks.
+    if (wf.settings.handoff.batch) {
+      await prisma.notificationLog.update({ where: { id: marker }, data: { status: 'queued' } });
+      continue;
+    }
+    const recipients = await stageRecipients(wf, stage, data);
     const url = recordUrl(ctx.cfg, wf, row.id);
     const subject = `[${wf.name}] New task — ${stage.name}: #${row.number} ${title}`;
     const html = layout(
@@ -102,8 +107,24 @@ export async function sendRule(ctx: JobContext, wf: LoadedWorkflow, row: Pick<Re
     const subject = renderTemplate(def.email.subject, tctx);
     // Rich-editor bodies are HTML (sanitised); plain-text bodies keep their line breaks.
     const rendered = renderTemplate(def.email.body, tctx, { html: true });
-    const body = isHtmlBody(def.email.body) ? sanitizeEmailHtml(rendered) : rendered.replace(/\n/g, '<br>');
+    let body = isHtmlBody(def.email.body) ? sanitizeEmailHtml(rendered) : rendered.replace(/\n/g, '<br>');
+    // Files of the chosen file fields (uploads and generated documents) go with the email.
+    let attachments: MailMessage['attachments'];
+    let attachmentError: string | undefined;
+    const ids = (def.email.attachments ?? []).flatMap((k) => (Array.isArray(data[k]) ? (data[k] as string[]) : []));
+    if (ids.length) {
+      try {
+        const loaded = await loadAttachments(prisma, wf.orgId, ids, ctx.cfg.UPLOAD_DIR);
+        attachments = loaded.files;
+        if (loaded.skipped.length) body += `<p style="color:#6e6e73;font-size:12px">Not attached (over 20 MB in total): ${loaded.skipped.map(escapeHtml).join(', ')}. Open the record to download them.</p>`;
+      } catch (e) {
+        attachmentError = (e as Error).message;
+      }
+    }
     await send(await ctx.channelsFor(wf.orgId), {
+      fromName: def.email.fromName ? renderTemplate(def.email.fromName, tctx) : undefined,
+      attachments,
+      attachmentError,
       key,
       kind: 'rule',
       ruleId,
@@ -142,24 +163,25 @@ async function webhooks(ctx: JobContext, wf: LoadedWorkflow, row: RecordRow, sta
     if (hook.afterStage && states.find((s) => s.stageKey === hook.afterStage)?.status !== 'done') continue;
     if (!evaluateGroup(hook.when, data)) continue;
     const dedupeKey = `webhook:${hook.key}:${row.id}`;
-    if (await prisma.notificationLog.findUnique({ where: { dedupeKey } })) continue;
+    // Same delivery state machine as email / WhatsApp (pending → sent | failed → retried with
+    // back-off by the sweep, max MAX_ATTEMPTS). Before, a failure was retried only by the queue for
+    // ~2 minutes and then lost without a trace.
+    const id = await claim(dedupeKey, { kind: 'webhook', channel: 'webhook', recipient: hook.url, recordId: row.id });
+    if (!id) continue;
     const picked = hook.fields.length ? Object.fromEntries(hook.fields.map((k) => [k, data[k] ?? null])) : data;
     const body = JSON.stringify({ event: 'record.matched', webhook: hook.key, workflow: wf.key, record: { id: row.id, number: row.number, data: picked }, sentAt: new Date().toISOString() });
     const headers: Record<string, string> = { 'content-type': 'application/json', 'x-fms-delivery': dedupeKey };
     if (hook.secret) headers['x-fms-signature'] = `sha256=${createHmac('sha256', hook.secret).update(body).digest('hex')}`;
-    let res: Response;
     try {
-      res = await guardedFetch(hook.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(10_000) });
+      const res = await guardedFetch(hook.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) throw new Error(`Webhook ${hook.key} responded ${res.status}`);
+      await prisma.notificationLog.update({ where: { id }, data: { status: 'sent', error: null } });
+      ctx.log.info({ recordId: row.id, webhook: hook.key }, 'webhook delivered');
     } catch (e) {
-      if (!(e instanceof BlockedUrlError)) throw e;
-      // A blocked address never becomes deliverable by retrying: record it once and move on.
-      await prisma.notificationLog.create({ data: { dedupeKey, kind: 'webhook', channel: 'webhook', recipient: hook.url, status: 'failed', attempts: MAX_ATTEMPTS, error: e.message, recordId: row.id } });
-      ctx.log.warn({ recordId: row.id, webhook: hook.key, err: e.message }, 'webhook blocked');
-      continue;
+      const message = String((e as Error).message ?? e).slice(0, 1000);
+      // A blocked address never becomes deliverable: give up at once instead of retrying.
+      await prisma.notificationLog.update({ where: { id }, data: { status: 'failed', error: message, ...(e instanceof BlockedUrlError ? { attempts: MAX_ATTEMPTS } : {}) } });
+      ctx.log.warn({ recordId: row.id, webhook: hook.key, err: message }, 'webhook failed');
     }
-    // Throwing makes BullMQ retry with backoff; other side effects of this job are deduped.
-    if (!res.ok) throw new Error(`Webhook ${hook.key} responded ${res.status}`);
-    await prisma.notificationLog.create({ data: { dedupeKey, kind: 'webhook', channel: 'webhook', recipient: hook.url, status: 'sent', recordId: row.id } });
-    ctx.log.info({ recordId: row.id, webhook: hook.key }, 'webhook delivered');
   }
 }

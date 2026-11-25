@@ -66,6 +66,7 @@ export default async function publicRoutes(app: FastifyInstance) {
         lineItem: f.lineItem,
         options: wf.options.get(f.key) ?? f.options,
         dependsOn: f.dependsOn,
+        dependsOnLabel: f.dependsOn ? wf.def.fields.find((x) => x.key === f.dependsOn)?.label : undefined,
         optionMap: f.optionMap,
         helpText: f.helpText,
         placeholder: f.placeholder,

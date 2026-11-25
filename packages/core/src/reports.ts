@@ -4,7 +4,8 @@
  * in *working* hours via the business calendar.
  */
 import type { BusinessCalendar } from './calendar.js';
-import type { StageDef } from './schema.js';
+import { isEmptyValue } from './conditions.js';
+import type { FieldDef, RecordData, StageDef } from './schema.js';
 import type { StageState, StageStatus } from './timeline.js';
 
 export interface ReportRecord {
@@ -101,6 +102,42 @@ export function pendingTasks(records: readonly ReportRecord[], now: Date, cal: B
     }
   }
   return tasks.sort((a, b) => (b.delayHours ?? -Infinity) - (a.delayHours ?? -Infinity));
+}
+
+export interface MissingFieldsRow {
+  recordId: string;
+  recordNumber: number;
+  title?: string;
+  stageKey: string;
+  /** Labels of the step's fields that are still empty; required ones first. */
+  missing: { key: string; label: string; required: boolean }[];
+}
+
+/**
+ * Legacy Rep_Step: for each record at a step (its active step, or only `stageKey`), which of that
+ * step's fields are still empty. Hidden, calculated and automatic fields are not counted; records
+ * with nothing missing are left out.
+ */
+export function missingFields(
+  records: readonly (ReportRecord & { data: RecordData })[],
+  stages: readonly StageDef[],
+  fields: readonly FieldDef[],
+  opts: { stageKey?: string; visible?: ReadonlySet<string> } = {},
+): MissingFieldsRow[] {
+  const out: MissingFieldsRow[] = [];
+  const docFields = new Set(stages.flatMap((s) => (s.document ? [s.document.fieldKey] : [])));
+  const countable = (f: FieldDef) => !f.hidden && !['computed', 'user-email'].includes(f.type) && !docFields.has(f.key) && (!opts.visible || opts.visible.has(f.key));
+  for (const r of records) {
+    for (const s of r.stages) {
+      if (s.status !== 'active' || (opts.stageKey && s.stageKey !== opts.stageKey)) continue;
+      const missing = fields
+        .filter((f) => f.stageKey === s.stageKey && countable(f) && (isEmptyValue(r.data[f.key]) || (f.required && r.data[f.key] === false)))
+        .map((f) => ({ key: f.key, label: f.label, required: f.required }))
+        .sort((a, b) => Number(b.required) - Number(a.required));
+      if (missing.length) out.push({ recordId: r.id, recordNumber: r.number, title: r.title, stageKey: s.stageKey, missing });
+    }
+  }
+  return out.sort((a, b) => b.missing.filter((m) => m.required).length - a.missing.filter((m) => m.required).length || a.recordNumber - b.recordNumber);
 }
 
 /** Legacy Rep_Ord_Status: record × stage matrix. */

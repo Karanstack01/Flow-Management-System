@@ -1,7 +1,7 @@
 import clsx from 'clsx';
 import { ArrowRight, ChevronDown, CornerDownLeft, EllipsisVertical, Eye, FileText, GitBranch, Globe, Hourglass, Layers, Lock, Megaphone, PlayCircle, Settings2, StickyNote, Trash2, Users, Webhook } from 'lucide-react';
 import { createContext, memo, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
+import { Handle, NodeToolbar, Position, type Node, type NodeProps } from '@xyflow/react';
 import { conditionCases, ELSE_HANDLE, type CanvasNodeType, type ConditionGroup, type ConditionNodeData, type FieldDef, type JumpNodeData, type MessageNodeData, type StageDef, type TimerNodeData, type WebhookNodeData, type WorkflowDef } from '@fms/core';
 
 export type FlowNode = Node<Record<string, unknown>, CanvasNodeType>;
@@ -73,6 +73,49 @@ function PreviewButton({ id, className }: { id: string; className?: string }) {
     >
       <Eye className="size-4" />
     </button>
+  );
+}
+
+/** Gear button: opens the step's settings (the only single-click way in; dragging never opens them). */
+function SettingsButton({ id, className }: { id: string; className?: string }) {
+  const { onOpen } = useEditor();
+  return (
+    <button
+      type="button"
+      title="Settings"
+      aria-label="Open settings"
+      onClick={(e) => (e.stopPropagation(), onOpen(id))}
+      className={clsx('nodrag grid size-7 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-surface-2 hover:text-fg', className)}
+    >
+      <Settings2 className="size-4" />
+    </button>
+  );
+}
+
+/**
+ * Floating actions above the selected step. A click on a step only selects it, so moving and
+ * aligning steps stays undisturbed; these are the explicit ways to act on it.
+ */
+function StepActions({ id, preview = true, settingsLabel = 'Settings' }: { id: string; preview?: boolean; settingsLabel?: string }) {
+  const { onPreview, onOpen, onDelete } = useEditor();
+  const btn = 'inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[13px] font-medium transition-[background-color,color,transform] duration-200 ease-[var(--ease-apple)] active:scale-95 [&>svg]:size-4';
+  return (
+    <NodeToolbar position={Position.Top} offset={10}>
+      <div className="nodrag flex animate-pop-in items-center gap-0.5 rounded-xl border border-line/80 bg-surface/95 p-1 text-fg shadow-[var(--shadow-float)] backdrop-blur-xl" role="toolbar" aria-label="Step actions">
+        <button type="button" className={clsx(btn, 'bg-primary text-primary-fg hover:opacity-90')} onClick={() => onOpen(id)}>
+          <Settings2 /> {settingsLabel}
+        </button>
+        {preview && (
+          <button type="button" className={clsx(btn, 'text-muted hover:bg-surface-2 hover:text-fg')} onClick={() => onPreview(id)}>
+            <Eye /> Preview
+          </button>
+        )}
+        <span className="mx-0.5 h-5 w-px bg-line" aria-hidden />
+        <button type="button" title="Delete" aria-label="Delete step" className={clsx(btn, 'px-2 text-muted hover:bg-danger-soft hover:text-danger')} onClick={() => onDelete(id)}>
+          <Trash2 />
+        </button>
+      </div>
+    </NodeToolbar>
   );
 }
 
@@ -148,6 +191,7 @@ function StepCard({ id, type, selected, stage, children }: { id: string; type: '
         issue === 'warning' && !selected && 'ring-2 ring-warning/70',
       )}
     >
+      <StepActions id={id} />
       <Handle type="target" position={Position.Left} className="!size-2.5 !border-2 !border-surface !bg-amber-400" />
       <div className="flex items-center gap-2.5 px-3.5 pb-1 pt-3">
         <span className={clsx('grid size-9 shrink-0 place-items-center rounded-xl [&>svg]:size-[18px]', tone.bg, tone.fg)} style={type === 'stage' ? { color: stage.color } : undefined}>
@@ -157,6 +201,7 @@ function StepCard({ id, type, selected, stage, children }: { id: string; type: '
           {stage.name}
         </span>
         <PreviewButton id={id} />
+        <SettingsButton id={id} />
         <NodeMenu id={id} />
       </div>
       <div className="px-3.5 pb-3 text-[12px] leading-relaxed">{children}</div>
@@ -206,11 +251,13 @@ function Shell({ id, type, selected, title, children, target = true, source = tr
         issue === 'warning' && !selected && 'ring-2 ring-warning/70',
       )}
     >
+      <StepActions id={id} />
       {target && <Handle type="target" position={Position.Left} />}
-      <div className={clsx('flex items-center gap-2 rounded-t-xl border-b px-2.5 py-1.5', tone.bg, tone.border)} style={accent ? { borderTop: `3px solid ${accent}` } : undefined}>
-        <span className={clsx('shrink-0 [&>svg]:size-3.5', tone.fg)}>{m.icon}</span>
+      <div className={clsx('flex items-center gap-1 rounded-t-xl border-b px-2.5 py-1.5', tone.bg, tone.border)} style={accent ? { borderTop: `3px solid ${accent}` } : undefined}>
+        <span className={clsx('mr-1 shrink-0 [&>svg]:size-3.5', tone.fg)}>{m.icon}</span>
         <span className="min-w-0 flex-1 truncate text-xs font-semibold">{title}</span>
-        {type !== 'note' && <PreviewButton id={id} className="-my-1 size-6 [&>svg]:size-3.5" />}
+        <PreviewButton id={id} className="-my-1 size-6 [&>svg]:size-3.5" />
+        <SettingsButton id={id} className="-my-1 size-6 [&>svg]:size-3.5" />
       </div>
       <div className="px-2.5 py-2 text-[11px] leading-relaxed">{children}</div>
       {source && <Handle type="source" position={Position.Right} />}
@@ -361,9 +408,10 @@ const WebhookNode = memo(function WebhookNode({ id, data, selected }: NodeProps<
   );
 });
 
-const NoteNode = memo(function NoteNode({ data, selected }: NodeProps<FlowNode>) {
+const NoteNode = memo(function NoteNode({ id, data, selected }: NodeProps<FlowNode>) {
   return (
     <div className={clsx('w-52 animate-pop-in rounded-xl border border-yellow-300 bg-yellow-100 p-3 text-xs text-yellow-950 shadow-[var(--shadow-soft)] transition-shadow duration-200 hover:shadow-[var(--shadow-float)] dark:border-yellow-500/40 dark:bg-yellow-900/40 dark:text-yellow-100', selected && 'ring-2 ring-info')}>
+      <StepActions id={id} preview={false} settingsLabel="Edit note" />
       <p className="whitespace-pre-wrap">{(data.text as string) || 'Double-click to write a note'}</p>
     </div>
   );

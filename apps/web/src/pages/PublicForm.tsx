@@ -2,8 +2,8 @@ import { useQuery } from '@tanstack/react-query';
 import { CheckCircle2, Copy, Plus, Trash2 } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { useParams } from 'react-router';
-import type { FieldValue } from '@fms/core';
-import { FieldInput, fieldDefaults } from '../components/FieldInput';
+import { staleDependents, type FieldValue } from '@fms/core';
+import { changeWithDependents, FieldInput, fieldDefaults } from '../components/FieldInput';
 import { StackDroveLogo } from '../components/StackDroveLogo';
 import { StageIntro } from '../components/StageIntro';
 import { Button, ErrorNote, FormField, Spinner } from '../components/ui';
@@ -83,7 +83,13 @@ function Form({ token, form }: { token: string; form: PublicFormView }) {
     );
   }
 
-  const setItem = (i: number, key: string, v: FieldValue) => setState((s) => ({ ...s, items: s.items.map((it, j) => (j === i ? { ...it, [key]: v } : it)) }));
+  // Changing a dropdown clears dependent dropdowns below it that no longer fit (header and rows).
+  const setItem = (i: number, key: string, v: FieldValue) => setState((s) => ({ ...s, items: s.items.map((it, j) => (j === i ? changeWithDependents(form.fields, it, key, v, { context: s.header }) : it)) }));
+  const setHead = (key: string, v: FieldValue) =>
+    setState((s) => {
+      const header = changeWithDependents(form.fields, s.header, key, v);
+      return { header, items: s.items.map((it) => ({ ...it, ...staleDependents(itemFields, { ...header, ...it }, [key]) })) };
+    });
   return (
     <form onSubmit={submit} className="card space-y-5 p-6 sm:p-8">
       <header>
@@ -96,7 +102,7 @@ function Form({ token, form }: { token: string; form: PublicFormView }) {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {headerFields.map((f) => (
           <FormField key={f.key} label={f.label} required={f.required} error={errors[f.key]} hint={f.helpText} className={f.type === 'textarea' ? 'sm:col-span-2' : undefined}>
-            <FieldInput field={f} value={state.header[f.key]} onChange={(v) => setState((s) => ({ ...s, header: { ...s.header, [f.key]: v } }))} zone={form.timezone} data={state.header} invalid={!!errors[f.key]} />
+            <FieldInput field={f} value={state.header[f.key]} onChange={(v) => setHead(f.key, v)} zone={form.timezone} data={state.header} invalid={!!errors[f.key]} />
           </FormField>
         ))}
       </div>

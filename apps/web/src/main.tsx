@@ -6,7 +6,16 @@ import { Toaster } from 'sonner';
 import { ApiError } from './lib/api';
 import { AuthProvider } from './lib/auth';
 import { router } from './router';
+import { applyTheme, useTheme } from './lib/theme';
 import './index.css';
+
+// Before the first paint, on every page (editor, login and public form included).
+applyTheme();
+
+function ThemedToaster() {
+  const { isDark } = useTheme();
+  return <Toaster richColors position="top-right" theme={isDark ? 'dark' : 'light'} />;
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -23,7 +32,7 @@ createRoot(document.getElementById('root')!).render(
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <RouterProvider router={router} />
-        <Toaster richColors position="top-right" />
+        <ThemedToaster />
       </AuthProvider>
     </QueryClientProvider>
   </StrictMode>,

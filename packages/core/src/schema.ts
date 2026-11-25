@@ -27,6 +27,8 @@ export const FIELD_TYPES = [
   'computed', // legacy formula / Formula-Nowrap / formula_long
 ] as const;
 export type FieldType = (typeof FIELD_TYPES)[number];
+/** What a Dependent Dropdown can hang off: one chosen value (Country → State → City chains allowed). */
+export const DEPENDENT_PARENT_TYPES: readonly FieldType[] = ['select', 'combobox', 'dependent-select'];
 
 export const CONDITION_OPS = ['empty', 'not_empty', 'is_true', 'is_false', 'eq', 'neq', 'in', 'gt', 'gte', 'lt', 'lte'] as const;
 export type ConditionOp = (typeof CONDITION_OPS)[number];
@@ -325,8 +327,30 @@ export const workflowDefSchema = z
 
     wf.fields.forEach((f, i) => {
       if (f.type === 'dependent-select') {
-        if (!f.dependsOn) ctx.addIssue({ code: 'custom', path: ['fields', i, 'dependsOn'], message: 'dependent-select needs dependsOn' });
-        else refField(f.dependsOn, ['fields', i, 'dependsOn']);
+        const path = ['fields', i, 'dependsOn'];
+        if (!f.dependsOn) ctx.addIssue({ code: 'custom', path, message: `${f.label}: a dependent dropdown needs the field it depends on` });
+        else if (f.dependsOn === f.key) ctx.addIssue({ code: 'custom', path, message: `${f.label}: a dropdown can not depend on itself` });
+        else {
+          refField(f.dependsOn, path);
+          const parent = fieldKeys.get(f.dependsOn);
+          const stageIndex = (k: string) => wf.stages.findIndex((s) => s.key === k);
+          if (parent && !DEPENDENT_PARENT_TYPES.includes(parent.type)) {
+            ctx.addIssue({ code: 'custom', path, message: `${f.label}: it can only depend on a Dropdown, Dropdown + free text or another Dependent Dropdown` });
+          } else if (parent && stageIndex(parent.stageKey) > stageIndex(f.stageKey)) {
+            ctx.addIssue({ code: 'custom', path, message: `${f.label}: “${parent.label}” is filled in a later stage, so it can not be chosen first` });
+          } else if (parent?.lineItem && !f.lineItem) {
+            ctx.addIssue({ code: 'custom', path, message: `${f.label}: “${parent.label}” is a repeating-row field, so this field must be one too` });
+          }
+          // Country → State → City is fine; City → … → City is a loop.
+          const seen = new Set([f.key]);
+          for (let p = parent; p?.type === 'dependent-select' && p.dependsOn; p = fieldKeys.get(p.dependsOn)) {
+            if (seen.has(p.dependsOn)) {
+              ctx.addIssue({ code: 'custom', path, message: `${f.label}: dependent dropdowns depend on each other in a loop` });
+              break;
+            }
+            seen.add(p.dependsOn);
+          }
+        }
       }
       if (f.type === 'computed') {
         if (!f.expression) {
@@ -382,26 +406,89 @@ export type CalendarConfig = z.infer<typeof calendarSchema>;
 export const CHANNELS = ['email', 'whatsapp'] as const;
 export type Channel = (typeof CHANNELS)[number];
 
+/** Reports that can be emailed on a schedule (legacy Rep_Stage, Rep_Pending, Rep_Activity_Funnel, Rep_Ord_Status, Rep_Step). */
+export const REPORT_KINDS = ['summary', 'pending', 'funnel', 'matrix', 'missing'] as const;
+export type ReportKind = (typeof REPORT_KINDS)[number];
+const hourOfDay = z.number().int().min(0).max(23);
+const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/);
+const phoneNumber = z.string().trim().regex(/^\+?[\d\s()-]{6,20}$/, 'Phone numbers need digits only, with the country code');
+
 export const workflowSettingsSchema = z.object({
   channels: z.array(z.enum(CHANNELS)).default(['email']),
   /** Legacy AE18: send reminders/digests on holidays too. */
   sendOnHolidays: z.boolean().default(false),
-  /** Notify a stage's responsible groups when the stage becomes active (legacy onformsubmit). */
-  handoff: z.object({ enabled: z.boolean().default(true) }).default({}),
-  /** Remind before the planned time, as a fraction of the stage TAT (legacy rows 3–6) or fixed hours. */
+  /**
+   * Notify a stage's responsible groups when the stage becomes active (legacy onformsubmit).
+   * `batch`: like the legacy sheet, one message per person every few minutes listing all their new
+   * tasks, instead of one message per record.
+   */
+  handoff: z.object({ enabled: z.boolean().default(true), batch: z.boolean().default(false) }).default({}),
+  /**
+   * Remind before the planned time (legacy reminder tiers, Settings rows 3–6). `hoursBefore` is the
+   * first level; `tiers` add more, each either fixed working hours or a share of the stage's TAT.
+   */
   upcoming: z
-    .object({ enabled: z.boolean().default(false), hoursBefore: z.number().min(0).max(240).default(2) })
+    .object({
+      enabled: z.boolean().default(false),
+      hoursBefore: z.number().min(0).max(240).default(2),
+      tiers: z
+        .array(z.object({ kind: z.enum(['hours', 'percent']), value: z.number().min(0).max(1000) }))
+        .max(4)
+        .default([]),
+    })
     .default({}),
   /** Daily overdue digest per responsible group (legacy sendpending, AK7). */
-  overdueDigest: z.object({ enabled: z.boolean().default(true), hour: z.number().int().min(0).max(23).default(9) }).default({}),
-  /** Daily management summary (legacy Rep_Stage / Rep_Activity_Funnel emails). */
+  overdueDigest: z.object({ enabled: z.boolean().default(true), hour: hourOfDay.default(9) }).default({}),
+  /**
+   * Scheduled reports (legacy Rep_* PDFs at up to four times a day, AK12:AK19): which reports, when,
+   * and to whom by email (as a PDF attachment) and WhatsApp.
+   */
   summaryReport: z
     .object({
       enabled: z.boolean().default(false),
-      hour: z.number().int().min(0).max(23).default(18),
+      hour: hourOfDay.default(18),
+      /** Up to four send times; empty = `hour` only. */
+      hours: z.array(hourOfDay).max(4).default([]),
+      reports: z.array(z.enum(REPORT_KINDS)).min(1).default(['summary', 'pending']),
       recipients: z.array(z.string().email()).default([]),
+      cc: z.array(z.string().email()).default([]),
+      whatsapp: z.array(phoneNumber).max(20).default([]),
+      /** Attach the report as a PDF (email). */
+      pdf: z.boolean().default(true),
+      /** "Fields still empty" report: the stage it checks (default: every active stage). */
+      missingStage: keySchema.optional(),
     })
     .default({}),
+  /** Records table: default sort and row colours (legacy Settings AF58/AF60 and AF64:AF66). */
+  table: z
+    .object({
+      defaultSort: z.object({ by: z.string().min(1).max(64), dir: z.enum(['asc', 'desc']) }).optional(),
+      rowColors: z
+        .array(z.object({ when: conditionGroupSchema, color: hexColor, label: z.string().trim().max(60).optional() }))
+        .max(20)
+        .default([]),
+    })
+    .default({}),
+  /**
+   * AI reports (legacy AI tab): every N hours, the matching records' chosen fields go to the
+   * organization's AI connection with the prompt, and the answer is emailed / sent on WhatsApp.
+   */
+  aiReports: z
+    .array(
+      z.object({
+        key: keySchema,
+        name: z.string().trim().min(1).max(120),
+        enabled: z.boolean().default(true),
+        prompt: z.string().trim().min(1).max(4000),
+        when: conditionGroupSchema.default({ mode: 'all', conditions: [] }),
+        fields: z.array(keySchema).max(60).default([]),
+        everyHours: z.number().int().min(1).max(168).default(24),
+        recipients: z.array(z.string().email()).default([]),
+        whatsapp: z.array(phoneNumber).max(20).default([]),
+      }),
+    )
+    .max(10)
+    .default([]),
   /** Auto-archive (legacy Archive!D1/H1 + archive trigger). */
   archive: z
     .object({
@@ -453,6 +540,10 @@ export const notificationRuleSchema = z
         cc: z.string().max(1000).optional(),
         subject: z.string().min(1).max(300),
         body: z.string().min(1).max(20000),
+        /** Sender name shown to recipients (legacy Messages "From" / AK21 alias); the address stays the connection's. */
+        fromName: z.string().trim().max(80).optional(),
+        /** File fields whose files are attached — uploads and generated documents (legacy attachments / autocrat). */
+        attachments: z.array(keySchema).max(10).default([]),
       })
       .optional(),
     whatsapp: z

@@ -113,7 +113,7 @@ export interface MessageNodeData {
   name?: string;
   event?: MessageEvent;
   repeatEveryDays?: number;
-  email?: { to: string; cc?: string; subject: string; body: string };
+  email?: { to: string; cc?: string; subject: string; body: string; fromName?: string; attachments?: string[] };
   whatsapp?: { to: string; body: string; template?: { name: string; language?: string; params: string[] } };
   isActive?: boolean;
 }
@@ -410,15 +410,8 @@ export function compileCanvas(canvas: Canvas, content: WorkflowDef, settings: Wo
       next.planned = e.stage.planned.mode === 'manual' ? { mode: 'manual' } : { mode: 'none' };
     }
     if (next.completion.kind === 'on_create') next.completion = { kind: 'manual' };
-    // Document step: waits for a review (Mark done), or completes as soon as the file is generated.
-    if (next.document) {
-      next.completion = next.document.requireReview ? { kind: 'manual' } : { kind: 'conditions', when: { mode: 'all', conditions: [{ field: next.document.fieldKey, op: 'not_empty' }] } };
-    }
     return next;
   });
-  // The generated file is what a document step is for: it must exist before the stage can be done.
-  const docFields = new Set(orderedStages.flatMap((s) => (s.document ? [s.document.fieldKey] : [])));
-  const fields = content.fields.map((f) => (docFields.has(f.key) ? { ...f, required: true } : f));
   // Jumps back to the intake form are not allowed (it is never reopened).
   for (const [key, jumps] of jumpsByStage) {
     if (jumps.some((j) => j.to === orderedStages[0]?.key)) {
@@ -461,7 +454,12 @@ export function compileCanvas(canvas: Canvas, content: WorkflowDef, settings: Wo
         },
       });
       if (!parsed.success) errors.push({ nodeId: n.id, message: `${label(n)}: ${parsed.error.issues[0]?.message ?? 'invalid'}` });
-      else rules.push({ nodeId: n.id, definition: parsed.data });
+      else {
+        // Attachments must be file fields of this flow (uploads or generated documents).
+        const bad = (parsed.data.email?.attachments ?? []).filter((k) => content.fields.find((f) => f.key === k)?.type !== 'file');
+        if (bad.length) errors.push({ nodeId: n.id, message: `${label(n)}: attachments must be file fields (${bad.join(', ')})` });
+        else rules.push({ nodeId: n.id, definition: parsed.data });
+      }
     } else if (n.type === 'webhook') {
       const d = n.data as WebhookNodeData;
       const from = stageSources(n);
@@ -482,12 +480,45 @@ export function compileCanvas(canvas: Canvas, content: WorkflowDef, settings: Wo
 
   if (errors.length) return { definition: null, settings: null, rules, errors, warnings };
 
-  const def = workflowDefSchema.safeParse({ ...content, fields, stages: orderedStages });
+  const def = workflowDefSchema.safeParse({ ...content, stages: orderedStages });
   const set = workflowSettingsSchema.safeParse({ ...settings, webhooks });
   const nodeOfStage = (i: unknown) => (typeof i === 'number' ? emitted[i]?.nodeId : undefined);
   if (!def.success) for (const i of def.error.issues) errors.push({ nodeId: i.path[0] === 'stages' ? nodeOfStage(i.path[1]) : undefined, message: `${i.path.join('.')}: ${i.message}` });
   if (!set.success) for (const i of set.error.issues) errors.push({ message: `settings.${i.path.join('.')}: ${i.message}` });
-  return { definition: def.success ? def.data : null, settings: set.success ? set.data : null, rules, errors, warnings };
+  return { definition: def.success ? normalizeDocumentStages(def.data) : null, settings: set.success ? set.data : null, rules, errors, warnings };
+}
+
+/**
+ * Rules that follow from a stage being a document step, applied by every path that saves a
+ * definition (flow editor, form editor, API), so they can not drift apart:
+ *  - completion: wait for a review ("Approve & continue"), or complete as soon as the file exists;
+ *  - the document's file field is required (the step can not be done without its document);
+ *  - a backward Stage Jump that reopens a document step clears its file, so the document is
+ *    generated again from the corrected data instead of the step completing at once with the old one.
+ */
+export function normalizeDocumentStages(def: WorkflowDef): WorkflowDef {
+  const docFields = new Set(def.stages.flatMap((s) => (s.document ? [s.document.fieldKey] : [])));
+  if (!docFields.size) return def;
+  const index = new Map(def.stages.map((s, i) => [s.key, i]));
+  const stages = def.stages.map((s, i): StageDef => {
+    let next = s;
+    if (s.document) {
+      next = { ...next, completion: s.document.requireReview ? { kind: 'manual' } : { kind: 'conditions', when: { mode: 'all', conditions: [{ field: s.document.fieldKey, op: 'not_empty' }] } } };
+    }
+    if (s.jumps?.length) {
+      next = {
+        ...next,
+        jumps: s.jumps.map((j) => {
+          const t = index.get(j.to);
+          if (t === undefined || t >= i) return j;
+          const reopenedDocs = def.stages.slice(t, i + 1).flatMap((x) => (x.document ? [x.document.fieldKey] : []));
+          return reopenedDocs.length ? { ...j, clearFields: [...new Set([...j.clearFields, ...reopenedDocs])] } : j;
+        }),
+      };
+    }
+    return next;
+  });
+  return { ...def, stages, fields: def.fields.map((f) => (docFields.has(f.key) && !f.required ? { ...f, required: true } : f)) };
 }
 
 // ------------------------------------------------------------------ definition → canvas

@@ -2,13 +2,17 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import {
   isAdmin,
+  missingFields,
+  normalizeDocumentStages,
   pendingTasks,
+  worksOnStage,
   recordTitle,
   stageSummary,
   statusMatrix,
   visibleFieldKeys,
   workflowDefSchema,
   workflowSettingsSchema,
+  type RecordData,
   type ReportRecord,
 } from '@fms/core';
 import { prisma, Prisma, toStageStates, type LoadedWorkflow } from '@fms/db';
@@ -16,14 +20,14 @@ import { audit } from '../lib/audit.js';
 import { AppError, parse } from '../lib/errors.js';
 import { assertWorkflowSlot } from '../lib/license.js';
 import { groupSql } from '../lib/record-sql.js';
-import { describeWorkflow, getWorkflow, invalidateWorkflow, workflowFor } from '../lib/workflows.js';
+import { describeWorkflow, ensurePublicFormId, getWorkflow, invalidateWorkflow, workflowFor } from '../lib/workflows.js';
 import type { AuthUser } from '../plugins/auth.js';
 
 const wfParams = z.object({ wf: z.string().min(1).max(64) });
 const REPORT_LIMIT = 20_000;
 
 /** Non-archived records the principal may see, with their stages (row filter applied in SQL). */
-async function reportRecords(wf: LoadedWorkflow, p: AuthUser, range?: { from?: Date; to?: Date }): Promise<ReportRecord[]> {
+async function reportRecords(wf: LoadedWorkflow, p: AuthUser, range?: { from?: Date; to?: Date }): Promise<(ReportRecord & { data: RecordData })[]> {
   const rowFilter = isAdmin(p) ? null : p.rowFilter;
   const rows = await prisma.$queryRaw<{ id: string; number: number; data: Record<string, unknown> }[]>`
     SELECT r."id", r."number", r."data" FROM "Record" r
@@ -36,7 +40,8 @@ async function reportRecords(wf: LoadedWorkflow, p: AuthUser, range?: { from?: D
   for (const s of stages) byRecord.set(s.recordId, [...(byRecord.get(s.recordId) ?? []), s]);
   const visible = visibleFieldKeys(wf.def.fields, p, wf.def.stages);
   const titleFields = wf.def.fields.filter((f) => visible.has(f.key));
-  return rows.map((r) => ({ id: r.id, number: r.number, title: recordTitle(titleFields, r.data as never, r.number), stages: toStageStates(byRecord.get(r.id) ?? []) }));
+  // `data` stays on the server (the empty-fields report reads it); responses never include it.
+  return rows.map((r) => ({ id: r.id, number: r.number, title: recordTitle(titleFields, r.data as never, r.number), data: r.data as RecordData, stages: toStageStates(byRecord.get(r.id) ?? []) }));
 }
 
 export default async function workflowRoutes(app: FastifyInstance) {
@@ -63,7 +68,7 @@ export default async function workflowRoutes(app: FastifyInstance) {
   app.get('/workflows/:wf/definition', admin, async (req) => {
     const { wf: key } = parse(wfParams, req.params);
     const wf = await getWorkflow(req.principal.orgId, key);
-    return { id: wf.id, version: wf.version, calendarId: wf.calendarId, isActive: wf.isActive, definition: wf.def, settings: wf.settings };
+    return { id: wf.id, version: wf.version, calendarId: wf.calendarId, isActive: wf.isActive, isDraft: wf.isDraft, definition: wf.def, settings: wf.settings };
   });
 
   app.get('/workflows/:wf/versions', admin, async (req) => {
@@ -82,7 +87,7 @@ export default async function workflowRoutes(app: FastifyInstance) {
 
   app.post('/workflows', admin, async (req, reply) => {
     const body = parse(saveBody, req.body);
-    const definition = parse(workflowDefSchema, body.definition);
+    const definition = await ensurePublicFormId(null, normalizeDocumentStages(parse(workflowDefSchema, body.definition)));
     const settings = parse(workflowSettingsSchema, body.settings ?? {});
     const calendarId = body.calendarId ?? (await prisma.businessCalendar.findFirst({ where: { orgId: req.principal.orgId }, select: { id: true } }))?.id;
     if (!calendarId) throw AppError.badRequest('Create a business calendar first');
@@ -98,8 +103,10 @@ export default async function workflowRoutes(app: FastifyInstance) {
           definition: definition as Prisma.InputJsonObject,
           settings: settings as Prisma.InputJsonObject,
           calendarId,
+          // Every new flow starts as a draft (same lifecycle as All Flows › Create); it goes live by publishing.
+          isDraft: true,
           createdById: req.principal.userId,
-          versions: { create: { version: 1, definition: definition as Prisma.InputJsonObject, settings: settings as Prisma.InputJsonObject, createdById: req.principal.userId } },
+          versions: { create: { version: 1, definition: definition as Prisma.InputJsonObject, settings: settings as Prisma.InputJsonObject, note: 'created', createdById: req.principal.userId } },
         },
       });
       await audit(tx, { orgId: wf.orgId, actor: req.principal, action: 'workflow.created', entityType: 'Workflow', entityId: wf.id, ip: req.ip });
@@ -113,8 +120,10 @@ export default async function workflowRoutes(app: FastifyInstance) {
     const { wf: key } = parse(wfParams, req.params);
     const body = parse(saveBody, req.body);
     const wf = await getWorkflow(req.principal.orgId, key);
-    const definition = parse(workflowDefSchema, body.definition);
+    const definition = await ensurePublicFormId(wf.id, normalizeDocumentStages(parse(workflowDefSchema, body.definition)));
     if (definition.key !== wf.key) throw AppError.badRequest('The workflow key cannot be changed');
+    // Draft → live happens by publishing in the flow editor; a draft has no active/inactive switch.
+    if (wf.isDraft && body.isActive !== undefined && body.isActive !== wf.isActive) throw AppError.badRequest('Publish the draft in the flow editor first');
     const settings = parse(workflowSettingsSchema, body.settings ?? wf.settings);
     if (body.calendarId) await assertCalendar(req.principal.orgId, body.calendarId);
     const version = await prisma.$transaction(async (tx) => {
@@ -130,7 +139,7 @@ export default async function workflowRoutes(app: FastifyInstance) {
           version: { increment: 1 },
         },
       });
-      await tx.workflowVersion.create({ data: { workflowId: wf.id, version: row.version, definition: definition as Prisma.InputJsonObject, settings: settings as Prisma.InputJsonObject, createdById: req.principal.userId } });
+      await tx.workflowVersion.create({ data: { workflowId: wf.id, version: row.version, definition: definition as Prisma.InputJsonObject, settings: settings as Prisma.InputJsonObject, note: 'form_editor', createdById: req.principal.userId } });
       await audit(tx, { orgId: wf.orgId, actor: req.principal, action: 'workflow.published', entityType: 'Workflow', entityId: wf.id, diff: { version: row.version }, ip: req.ip });
       return row.version;
     });
@@ -155,6 +164,16 @@ export default async function workflowRoutes(app: FastifyInstance) {
     const wf = await workflowFor(req.principal, key);
     const tasks = pendingTasks(await reportRecords(wf, req.principal), new Date(), wf.calendar, { overdueOnly: overdueOnly === 'true' });
     return { items: (stage ? tasks.filter((t) => t.stageKey === stage) : tasks).slice(0, 2000) };
+  });
+
+  /** Legacy Rep_Step: which fields are still empty at each record's current step (or one step). */
+  app.get('/workflows/:wf/reports/missing', async (req) => {
+    const { wf: key } = parse(wfParams, req.params);
+    const { stage } = parse(z.object({ stage: z.string().max(64).optional() }), req.query);
+    const wf = await workflowFor(req.principal, key);
+    const visible = visibleFieldKeys(wf.def.fields, req.principal, wf.def.stages);
+    const rows = missingFields(await reportRecords(wf, req.principal), wf.def.stages, wf.def.fields, { stageKey: stage || undefined, visible });
+    return { items: rows.slice(0, 2000), total: rows.length };
   });
 
   app.get('/workflows/:wf/reports/matrix', async (req) => {
@@ -209,7 +228,7 @@ export default async function workflowRoutes(app: FastifyInstance) {
     const items = [];
     for (const { id } of workflows) {
       const wf = await getWorkflow(p.orgId, id);
-      const mine = wf.def.stages.filter((s) => s.responsibleGroups.some((g) => p.groups.includes(g)));
+      const mine = wf.def.stages.filter((s) => worksOnStage(s, p));
       if (!mine.length) continue;
       const rows = await prisma.$queryRaw<{ id: string; number: number; data: Record<string, unknown>; stageKey: string; plannedAt: Date | null }[]>`
         SELECT r."id", r."number", r."data", s."stageKey", s."plannedAt"
@@ -225,6 +244,7 @@ export default async function workflowRoutes(app: FastifyInstance) {
         items.push({
           workflowKey: wf.key,
           workflowName: wf.name,
+          timezone: wf.calendar.config.timezone,
           recordId: r.id,
           recordNumber: r.number,
           title: recordTitle(titleFields, r.data as never, r.number),

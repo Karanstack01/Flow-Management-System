@@ -123,6 +123,27 @@ export function canSeeRecord(p: Principal, data: RecordData): boolean {
   return evaluateGroup(p.rowFilter, data);
 }
 
+/**
+ * Who works on a stage (My Tasks, "my tasks" filter, hand-offs, reminders, digests, completing it):
+ * its assigned **Editors** when Stage Access Control is on — that list replaces the owner groups,
+ * like a field's user list replaces its group rules — otherwise members of its owner groups.
+ * Admins are not "workers" (they are not notified), but may act on any stage.
+ */
+export function worksOnStage(stage: Pick<StageDef, 'responsibleGroups' | 'stageAccessRestricted' | 'stageUsers'>, p: Pick<Principal, 'email' | 'groups'>): boolean {
+  if (stage.stageAccessRestricted) {
+    const me = p.email.toLowerCase();
+    return (stage.stageUsers ?? []).some((u) => u.role === 'Editor' && u.email.toLowerCase() === me);
+  }
+  return stage.responsibleGroups.some((g) => p.groups.includes(g));
+}
+
+/** May this user complete / plan / regenerate a stage? */
+export function canActOnStage(stage: Pick<StageDef, 'responsibleGroups' | 'stageAccessRestricted' | 'stageUsers'>, p: Principal): boolean {
+  if (isAdmin(p)) return true;
+  if (stage.stageAccessRestricted || stage.responsibleGroups.length) return worksOnStage(stage, p);
+  return true; // unowned and unrestricted: anyone who can fill in its fields (checked by the caller)
+}
+
 /** A user is responsible for a stage when they belong to one of its groups. */
 export function isResponsibleFor(stageGroups: readonly string[], p: Principal): boolean {
   return isAdmin(p) || intersects(stageGroups, p.groups);

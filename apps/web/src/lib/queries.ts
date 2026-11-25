@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './api';
-import type { DashboardData, FlowsResponse, HistoryEntry, MyTask, PendingTask, RecordDto, RecordList, SavedViewDto, StageSummaryRow, TemplateSummary, WorkflowSummary, WorkflowView } from './types';
+import type { DashboardData, DeliveryLog, FlowsResponse, HistoryEntry, MyTask, PendingTask, RecordDto, RecordList, SavedViewDto, StageSummaryRow, TemplateSummary, WorkflowSummary, WorkflowView } from './types';
 
 export const qk = {
   workflows: ['workflows'] as const,
@@ -29,6 +29,8 @@ export interface RecordParams {
   archived?: string;
   mine?: string;
   filters?: string;
+  /** Columns on screen (comma separated) — they get filled / unique totals. */
+  cols?: string;
 }
 
 export const useRecords = (wf: string, params: RecordParams) =>
@@ -42,6 +44,10 @@ export const useRecord = (wf: string, id: string) => useQuery({ queryKey: qk.rec
 
 export const useHistory = (wf: string, id: string, enabled: boolean) =>
   useQuery({ queryKey: qk.history(wf, id), queryFn: () => api<{ items: HistoryEntry[] }>(`/workflows/${wf}/records/${id}/history`).then((r) => r.items), enabled });
+
+/** Hand-off / reminder / message / webhook deliveries of one record (admins only). */
+export const useDeliveries = (wf: string, id: string, enabled: boolean) =>
+  useQuery({ queryKey: ['deliveries', wf, id], queryFn: () => api<{ items: DeliveryLog[] }>(`/workflows/${wf}/records/${id}/notifications`).then((r) => r.items), enabled, refetchInterval: 60_000 });
 
 export const useSummary = (wf: string) =>
   useQuery({ queryKey: qk.summary(wf), queryFn: () => api<{ generatedAt: string; totalRecords: number; stages: StageSummaryRow[] }>(`/workflows/${wf}/reports/summary`), refetchInterval: 60_000 });
@@ -86,6 +92,7 @@ export function useRecordsInvalidation(wf: string) {
     void qc.invalidateQueries({ queryKey: ['records', wf] });
     void qc.invalidateQueries({ queryKey: ['record', wf] });
     void qc.invalidateQueries({ queryKey: ['history', wf] });
+    void qc.invalidateQueries({ queryKey: ['deliveries', wf] });
     void qc.invalidateQueries({ queryKey: qk.summary(wf) });
     void qc.invalidateQueries({ queryKey: ['pending', wf] });
     void qc.invalidateQueries({ queryKey: qk.myTasks });

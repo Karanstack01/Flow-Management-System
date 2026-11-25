@@ -1,7 +1,7 @@
 import type { Edge } from '@xyflow/react';
 import clsx from 'clsx';
-import { ArrowRight, ChevronDown, ChevronRight, CircleCheck, Eye, EyeOff, Lock, Maximize2, Minimize2, Plus, Trash2, X } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import { AlarmClock, Archive, ArrowRight, ArrowRightLeft, BarChart3, Bell, Brain, Table2, CalendarDays, CalendarOff, ChevronRight, CircleCheck, Eye, EyeOff, Info, ListTodo, Lock, Mail, Maximize2, MessageCircle, Minimize2, Plus, Trash2, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import {
   conditionCases,
   isStageNode,
@@ -19,28 +19,16 @@ import {
   type WorkflowSettings,
 } from '@fms/core';
 import { ConditionEditor } from '../../../components/ConditionEditor';
-import { Button, FormField, Input, Modal, Select, Tabs, Textarea } from '../../../components/ui';
+import { Button, FormField, Input, Modal, Select, Switch, Tabs, Textarea } from '../../../components/ui';
 import { FIELD_TYPE_LABEL, FieldSettings } from './FieldSettings';
 import { MessagePreview, RichTextEditor, TokenInput } from './MessageComposer';
-import { DocumentSettings, StageGeneral } from './StageSettings';
+import { AiReports, ScheduledReports, TableSettings } from './FlowSettingsExtras';
+import { DocumentSettings, Panel, StageGeneral, ToggleRow } from './StageSettings';
 import type { FlowNode } from './nodes';
 
 const EMPTY: ConditionGroup = { mode: 'all', conditions: [] };
 const slug = (s: string) => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, 'f_$1').slice(0, 64) || 'field';
 const list = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
-
-function Section({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <section className="border-b border-line">
-      <button type="button" className="flex w-full items-center gap-1.5 px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-muted" onClick={() => setOpen(!open)} aria-expanded={open}>
-        {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-        {title}
-      </button>
-      {open && <div className="space-y-3 px-4 pb-4">{children}</div>}
-    </section>
-  );
-}
 
 export interface InspectorProps {
   node: FlowNode | null;
@@ -109,16 +97,64 @@ export function Inspector(p: InspectorProps) {
 
 const conditionFields = (def: WorkflowDef) => def.fields.map((f) => ({ key: f.key, label: f.label, options: f.options }));
 
-function FlowSettings({ settings: s, onSettings, calendars, calendarId, onCalendar }: InspectorProps) {
-  const toggle = (label: string, checked: boolean, set: (v: boolean) => void) => (
-    <label className="flex items-center gap-2 text-sm">
-      <input type="checkbox" checked={checked} onChange={(e) => set(e.target.checked)} /> {label}
+/** A small number box with a unit after it ("2 hours before the due time"). */
+function NumberWithUnit({ value, onChange, min, max, step, unit, label }: { value: number; onChange: (v: number) => void; min: number; max: number; step?: number; unit: string; label: string }) {
+  const [text, setText] = useState(String(value));
+  // Follow undo / redo; half-typed text stays until it is a number again.
+  useEffect(() => {
+    if (Number(text) !== value) setText(String(value));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when the stored value changes
+  }, [value]);
+  return (
+    <label className="flex flex-wrap items-center gap-2 text-[13px] text-muted">
+      <Input
+        type="number"
+        aria-label={label}
+        className="h-9 w-20 text-center tabular-nums"
+        min={min}
+        max={max}
+        step={step ?? 1}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          const n = Number(e.target.value);
+          if (e.target.value !== '' && Number.isFinite(n)) onChange(Math.min(max, Math.max(min, n)));
+        }}
+        onBlur={() => setText(String(value))}
+      />
+      {unit}
     </label>
   );
+}
+
+/** Hour of the day as a list ("09:00"), so it can not be typed out of range. */
+function HourSelect({ value, onChange, label }: { value: number; onChange: (v: number) => void; label: string }) {
   return (
-    <>
-      <p className="px-4 pt-3 text-xs text-muted">Select a node to edit it. Drag steps from the left panel and connect them left to right.</p>
-      <Section title="Working calendar">
+    <label className="flex flex-wrap items-center gap-2 text-[13px] text-muted">
+      Every day at
+      <Select aria-label={label} className="h-9 w-28" value={value} onChange={(e) => onChange(Number(e.target.value))}>
+        {Array.from({ length: 24 }, (_, h) => (
+          <option key={h} value={h}>
+            {String(h).padStart(2, '0')}:00
+          </option>
+        ))}
+      </Select>
+    </label>
+  );
+}
+
+function FlowSettings({ settings: s, def, onSettings, calendars, calendarId, onCalendar, wide }: InspectorProps) {
+  const channel = (c: 'email' | 'whatsapp', on: boolean) => onSettings({ ...s, channels: on ? [...new Set([...s.channels, c])] : s.channels.filter((x) => x !== c) });
+  return (
+    <div className="space-y-3 p-4">
+      <p className="flex items-start gap-2 rounded-xl bg-info-soft px-3 py-2 text-xs text-info">
+        <Info className="mt-px size-3.5 shrink-0" />
+        <span>
+          Settings for the whole flow. To change a step, click it on the canvas and choose <b className="font-semibold">Settings</b> (or double-click it).
+        </span>
+      </p>
+
+      <Panel title="Working calendar" icon={<CalendarDays className="size-4 text-muted" />}>
         <Select value={calendarId} onChange={(e) => onCalendar(e.target.value)} aria-label="Business calendar">
           {calendars.map((c) => (
             <option key={c.id} value={c.id}>
@@ -126,29 +162,84 @@ function FlowSettings({ settings: s, onSettings, calendars, calendarId, onCalend
             </option>
           ))}
         </Select>
-        <p className="text-xs text-muted">Delay/Timer hours count only working hours on this calendar.</p>
-      </Section>
-      <Section title="Notifications">
-        {toggle('Email', s.channels.includes('email'), (v) => onSettings({ ...s, channels: v ? [...new Set([...s.channels, 'email' as const])] : s.channels.filter((c) => c !== 'email') }))}
-        {toggle('WhatsApp', s.channels.includes('whatsapp'), (v) => onSettings({ ...s, channels: v ? [...new Set([...s.channels, 'whatsapp' as const])] : s.channels.filter((c) => c !== 'whatsapp') }))}
-        {toggle('Notify the owners when a stage starts', s.handoff.enabled, (v) => onSettings({ ...s, handoff: { enabled: v } }))}
-        {toggle('Send on holidays and weekly offs', s.sendOnHolidays, (v) => onSettings({ ...s, sendOnHolidays: v }))}
-        <div className="flex items-center gap-2">
-          {toggle('Remind before due, hours:', s.upcoming.enabled, (v) => onSettings({ ...s, upcoming: { ...s.upcoming, enabled: v } }))}
-          <Input type="number" className="w-20" min={0} value={s.upcoming.hoursBefore} onChange={(e) => onSettings({ ...s, upcoming: { ...s.upcoming, hoursBefore: Number(e.target.value) } })} />
+        <p className="text-[11px] text-muted">Due times (Delay / Timer, TAT) count only the working hours of this calendar.</p>
+      </Panel>
+
+      <Panel title="Notifications" icon={<Bell className="size-4 text-muted" />}>
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted">Send by</p>
+        <div className={clsx('grid gap-2', wide ? 'grid-cols-2' : 'grid-cols-1 @xl:grid-cols-2')}>
+          <ToggleRow icon={<Mail />} title="Email" hint="Hand-offs, reminders and digests by email." checked={s.channels.includes('email')} onChange={(v) => channel('email', v)} />
+          <ToggleRow icon={<MessageCircle />} title="WhatsApp" hint="Needs an active WhatsApp connection (Settings › Connections)." checked={s.channels.includes('whatsapp')} onChange={(v) => channel('whatsapp', v)} />
         </div>
-        <div className="flex items-center gap-2">
-          {toggle('Daily overdue list at hour:', s.overdueDigest.enabled, (v) => onSettings({ ...s, overdueDigest: { ...s.overdueDigest, enabled: v } }))}
-          <Input type="number" className="w-20" min={0} max={23} value={s.overdueDigest.hour} onChange={(e) => onSettings({ ...s, overdueDigest: { ...s.overdueDigest, hour: Number(e.target.value) } })} />
-        </div>
-      </Section>
-      <Section title="Auto-archive" defaultOpen={false}>
-        <div className="flex items-center gap-2">
-          {toggle('Archive finished records after days:', s.archive.enabled, (v) => onSettings({ ...s, archive: { ...s.archive, enabled: v } }))}
-          <Input type="number" className="w-20" min={0} value={s.archive.completedDaysAgo} onChange={(e) => onSettings({ ...s, archive: { ...s.archive, completedDaysAgo: Number(e.target.value) } })} />
-        </div>
-      </Section>
-    </>
+        {s.channels.length === 0 && <p className="text-[11px] font-medium text-warning">No channel is on — nobody will be notified.</p>}
+
+        <p className="pt-1 text-[11px] font-semibold uppercase tracking-wide text-muted">When</p>
+        <ToggleRow icon={<ArrowRightLeft />} title="Hand-off when a stage starts" hint="The people who work on the next stage are told it is their turn." checked={s.handoff.enabled} onChange={(v) => onSettings({ ...s, handoff: { ...s.handoff, enabled: v } })}>
+          <label className="flex items-start gap-2.5 text-[13px]">
+            <Switch size="sm" label="One message per person" checked={s.handoff.batch} onChange={(v) => onSettings({ ...s, handoff: { ...s.handoff, batch: v } })} />
+            <span>
+              <span className="block font-medium">One message per person</span>
+              <span className="block text-[11px] text-muted">Like the old sheet: every few minutes each person gets one list of all their new tasks, instead of a message per record.</span>
+            </span>
+          </label>
+        </ToggleRow>
+        <ToggleRow icon={<AlarmClock />} title="Reminders before the due time" hint="Nudge the owners while there is still time — up to five reminders." checked={s.upcoming.enabled} onChange={(v) => onSettings({ ...s, upcoming: { ...s.upcoming, enabled: v } })}>
+          <div className="space-y-2">
+            <NumberWithUnit label="Hours before the due time" value={s.upcoming.hoursBefore} min={0} max={240} step={0.5} unit="working hours before the due time" onChange={(n) => onSettings({ ...s, upcoming: { ...s.upcoming, hoursBefore: n } })} />
+            {s.upcoming.tiers.map((t, i) => (
+              <div key={i} className="flex flex-wrap items-center gap-2">
+                <NumberWithUnit
+                  label={`Reminder ${i + 2}`}
+                  value={t.value}
+                  min={0}
+                  max={t.kind === 'percent' ? 100 : 240}
+                  step={t.kind === 'percent' ? 5 : 0.5}
+                  unit=""
+                  onChange={(n) => onSettings({ ...s, upcoming: { ...s.upcoming, tiers: s.upcoming.tiers.map((x, j) => (j === i ? { ...x, value: n } : x)) } })}
+                />
+                <Select
+                  aria-label={`Reminder ${i + 2} unit`}
+                  className="h-9 w-auto text-[13px]"
+                  value={t.kind}
+                  onChange={(e) => onSettings({ ...s, upcoming: { ...s.upcoming, tiers: s.upcoming.tiers.map((x, j) => (j === i ? { ...x, kind: e.target.value as 'hours' | 'percent' } : x)) } })}
+                >
+                  <option value="hours">working hours before</option>
+                  <option value="percent">% of the stage’s time left</option>
+                </Select>
+                <Button size="xs" variant="ghost" aria-label={`Remove reminder ${i + 2}`} icon={<Trash2 />} onClick={() => onSettings({ ...s, upcoming: { ...s.upcoming, tiers: s.upcoming.tiers.filter((_, j) => j !== i) } })} />
+              </div>
+            ))}
+            {s.upcoming.tiers.length < 4 && (
+              <Button size="xs" variant="soft" icon={<Plus />} onClick={() => onSettings({ ...s, upcoming: { ...s.upcoming, tiers: [...s.upcoming.tiers, { kind: 'percent', value: 25 }] } })}>
+                Add a reminder
+              </Button>
+            )}
+            <p className="text-[11px] text-muted">“% of the stage’s time left”: with a 8-hour TAT, 25 % reminds when 2 working hours are left (the old sheet’s reminder tiers).</p>
+          </div>
+        </ToggleRow>
+        <ToggleRow icon={<ListTodo />} title="Daily overdue list" hint="Each owner group gets one email with its late records." checked={s.overdueDigest.enabled} onChange={(v) => onSettings({ ...s, overdueDigest: { ...s.overdueDigest, enabled: v } })}>
+          <HourSelect label="Overdue list hour" value={s.overdueDigest.hour} onChange={(h) => onSettings({ ...s, overdueDigest: { ...s.overdueDigest, hour: h } })} />
+        </ToggleRow>
+        <ToggleRow icon={<BarChart3 />} title="Scheduled reports" hint="Stage summary, pending tasks, funnel, status matrix and empty fields — by email (PDF) and WhatsApp." checked={s.summaryReport.enabled} onChange={(v) => onSettings({ ...s, summaryReport: { ...s.summaryReport, enabled: v } })}>
+          <ScheduledReports s={s} def={def} onSettings={onSettings} />
+        </ToggleRow>
+        <ToggleRow icon={<CalendarOff />} title="Send on holidays and weekly offs" hint="Off: reminders and digests wait for the next working day." checked={s.sendOnHolidays} onChange={(v) => onSettings({ ...s, sendOnHolidays: v })} />
+      </Panel>
+
+      <Panel title="Auto-archive" icon={<Archive className="size-4 text-muted" />} defaultOpen={s.archive.enabled}>
+        <ToggleRow icon={<Archive />} title="Archive finished records" hint="Keeps the records list short; archived records can be restored." checked={s.archive.enabled} onChange={(v) => onSettings({ ...s, archive: { ...s.archive, enabled: v } })}>
+          <NumberWithUnit label="Days after the flow finished" value={s.archive.completedDaysAgo} min={0} max={3650} unit="days after the record finished" onChange={(n) => onSettings({ ...s, archive: { ...s.archive, completedDaysAgo: n } })} />
+        </ToggleRow>
+      </Panel>
+
+      <Panel title="Records table" icon={<Table2 className="size-4 text-muted" />} defaultOpen={!!s.table.defaultSort || s.table.rowColors.length > 0}>
+        <TableSettings s={s} def={def} onSettings={onSettings} />
+      </Panel>
+
+      <Panel title="AI reports" icon={<Brain className="size-4 text-muted" />} defaultOpen={s.aiReports.length > 0}>
+        <AiReports s={s} def={def} onSettings={onSettings} />
+      </Panel>
+    </div>
   );
 }
 
@@ -531,6 +622,36 @@ function MessageFields({ d, set, def }: { d: MessageNodeData; set: (patch: Parti
               <div>
                 <p className="label">Body</p>
                 <RichTextEditor def={def} value={d.email.body} onChange={(body) => set({ email: { ...d.email!, body } })} />
+              </div>
+              <FormField label="Sender name" hint="Shown as the sender; the address stays the email connection’s.">
+                <Input value={d.email.fromName ?? ''} placeholder="e.g. Acme Sales Team" onChange={(e) => set({ email: { ...d.email!, fromName: e.target.value || undefined } })} />
+              </FormField>
+              <div>
+                <p className="label">Attachments</p>
+                {def.fields.filter((f) => f.type === 'file').length === 0 ? (
+                  <p className="text-xs text-muted">Add a File Upload field or a Document step to attach files.</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {def.fields
+                      .filter((f) => f.type === 'file')
+                      .map((f) => {
+                        const on = (d.email!.attachments ?? []).includes(f.key);
+                        const docStage = def.stages.find((s) => s.document?.fieldKey === f.key);
+                        return (
+                          <label key={f.key} className="flex cursor-pointer items-center gap-2.5 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={on}
+                              onChange={(e) => set({ email: { ...d.email!, attachments: e.target.checked ? [...(d.email!.attachments ?? []), f.key] : (d.email!.attachments ?? []).filter((k) => k !== f.key) } })}
+                            />
+                            <span className="min-w-0 flex-1 truncate">{f.label}</span>
+                            <span className="text-[11px] text-muted">{docStage ? `document of “${docStage.name}”` : def.stages.find((s) => s.key === f.stageKey)?.name}</span>
+                          </label>
+                        );
+                      })}
+                    <p className="text-[11px] text-muted">The record’s files in these fields go with the email (up to 20 MB in total).</p>
+                  </div>
+                )}
               </div>
             </>
           )}

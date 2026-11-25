@@ -240,5 +240,28 @@ happen in the browser.
 | Table View / Dashboard tabs | `SavedView.columns` / `DashboardTile` |
 | Audit log sheet | `AuditLog` table (who, what, diff) |
 | Licence checks, self-update, short URLs | Dropped (normal SaaS deploy, own domain) |
-| Autocrat document generation | Phase 2: HTML templates → PDF service |
-| AI report | Phase 2: LLM summary job behind a provider interface |
+| Autocrat document generation | Document steps (HTML body → PDF / Word), attachable to message emails |
+| AI report | Flow settings › AI reports + Settings › Connections › Anthropic (Claude), every N hours |
+
+## 11. Parity review (2026-11-25)
+
+A second pass over `code.gs` and the HTML pages, feature by feature. Built in that pass:
+
+| Legacy | New platform |
+|---|---|
+| Messages: attachments (`autocrat`, file columns) | Rule / Message node › Attachments: any file field, including generated documents (email) |
+| Messages: sender (`Messages!K`, `AK21`) | Sender name per rule (the address stays the connection's) |
+| Reminder tiers (`Settings` rows 3–6, TAT × multiplier) | Flow settings › Reminders: up to five levels, hours or % of the stage's TAT |
+| `onformsubmit`: one email per person listing new tasks | Hand-off › "One message per person" (batched each sweep) |
+| `send_individual_rem` | "Send again" on the record page; "Resend message" on selected records |
+| `Rep_Stage` / `Rep_Pending` / `Rep_Activity_Funnel` / `Rep_Ord_Status` PDFs at `AK12:AK15` | Scheduled reports: up to 4 times a day, email with PDF + WhatsApp summary |
+| `Rep_Step` | Reports › Fields still empty (and in scheduled reports) |
+| View Table: column filters, count / sum / unique / avg, inline edit, row colours (`AF64:66`), image columns (`AE83`), default sort (`AF58/60`) | Column filter popovers, footer totals chooser, double-click editing, row colour rules, thumbnails, Flow settings › Records table |
+| `pastedatafun` (export rows to a sheet) | Export › Google Sheet (service account connection) |
+| EditResponse / `additional.html` (add rows to a submission) | Record page › Items in this submission |
+| `dropdown-search` | Searchable dropdown for lists longer than 7 |
+| Sheet formulas | Formulas with IF / AND / OR, text and date functions |
+| Dashboard tab tiles | Dashboard › Quick links, per group |
+| Data pasted into the sheet | Records › Import (CSV, checked before saving) |
+
+Still not built (decide before building): WhatsApp attachments (PDF of a message), per-rule document generation from Google Doc / Sheet / Slide templates (documents come from document steps instead), archive to an external sheet and archive timers other than the daily run, custom table views with HTML columns (`htmlformula`), due time computed by a formula (`TS_Formula`), per-flow form branding (logo, colours, item limit), custom form URL.

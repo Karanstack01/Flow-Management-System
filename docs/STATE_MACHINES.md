@@ -3,26 +3,33 @@
 An *implicit* state machine is a lifecycle that exists in behaviour but not in code: it is spread
 over several booleans, nullable timestamps or status strings, and its transitions are scattered
 `if`s. They tend to allow combinations nobody designed, and transitions that happen without an
-event. This is an audit of every one in the platform, what states and transitions it really has,
-and where it leaks.
+event. This is an audit of every one in the platform: what states and transitions it really has,
+where it leaked, and what was done about it.
 
 Severity: **High** = can lose or wrongly send data · **Medium** = surprising behaviour users will
 hit · **Low** = hygiene.
 
-| # | Machine | Where the state lives | Explicit? | Problems |
-|---|---|---|---|---|
-| 1 | Stage status | `RecordStage.status/plannedAt/actualAt`, derived by `computeTimeline` | Status enum, transitions implicit | **Medium** — silent regressions |
-| 2 | Record lifecycle | `Record.currentStageKey`, `completedAt`, `archivedAt`, `version` | No | Low |
-| 3 | Flow lifecycle | `Workflow.isDraft`, `isActive`, `deletedAt` | No | **Medium** — 8 combinations; "read-only" not enforced |
-| 4 | Organization access | `Organization.isActive`, `licenseExpiresAt`, `suspendedReason` | Derived (`orgAccessError`) | Low |
-| 5 | User account / lockout | `User.isActive`, `failedLogins`, `lockedUntil` | No | **Medium** — lockout never decays |
-| 6 | Session (refresh token) | `RefreshToken.revokedAt`, `expiresAt`, `family` | No | **High** — rotation race logs users out |
-| 7 | Super admin context | `User.isSuperAdmin`, `activeOrgId`, JWT `org` claim | No | Low |
-| 8 | Notification delivery | `NotificationLog.status` (`pending/sent/failed/skipped`) | Status strings | **High** — failures never retried; crashes strand messages |
-| 9 | Background job run | `JobRun.status` (`running/succeeded/failed`) | Status strings | Low — crashed runs stay "running" |
-| 10 | Client auth session | `status`, `user`, module `accessToken`, `isMockAuth`, `refreshing` | Partly | **Medium** — mock mode latches |
-| 11 | Flow editor UI | was `selectedId`, `inspectorOpen`, `busy` | **Now explicit** (`editor/machines.ts`) | Fixed |
-| 12 | Sidebar / menus | `collapsed`, `drawer`, flyout `fly`, menu `pos` | No | Low |
+| # | Machine | Where the state lives | Status |
+|---|---|---|---|
+| 1 | Stage status | `RecordStage.status/plannedAt/actualAt/round`, derived by `computeTimeline` | **Fixed** (2026-11-23): skips are final once passed |
+| 2 | Record lifecycle | `Record.currentStageKey`, `completedAt`, `archivedAt`, `version` | OK (follows #1) |
+| 3 | Flow lifecycle | `Workflow.isDraft`, `isActive`, `deletedAt` | **Fixed** — form editor path aligned 2026-11-23 |
+| 4 | Organization access | `Organization.isActive`, `licenseExpiresAt` | OK (centralised) |
+| 5 | User lockout | `User.failedLogins`, `lockedUntil` | Fixed |
+| 6 | Session / refresh token | `RefreshToken.revokedAt`, `family` | Fixed |
+| 7 | Super admin context | `User.activeOrgId` + JWT `org` | OK |
+| 8 | Delivery (email, WhatsApp, **webhooks**) | `NotificationLog.status/attempts` | Fixed; **webhooks joined 2026-11-23** |
+| 9 | Background job runs | `JobRun.status` | Fixed |
+| 10 | Client auth session | `status`, `user`, `accessToken`, mock flag | Fixed |
+| 11 | Flow editor UI | panel, save, preview, panel width | Explicit reducers; preview/shortcut leaks **fixed 2026-11-23** |
+| 12 | Sidebar / menus | `collapsed`, drawer, flyouts | Low, unchanged |
+| 13 | Theme | `localStorage fms-theme`, `<html data-theme>`, OS setting | **Medium — fixed 2026-11-23** |
+| 14 | Document step | stage status × file field × generation | **New**; one known gap |
+| 15 | Public form link | `publicForm`, `publicFormId`, flow + org state | **New**; uniqueness fixed |
+| 16 | Stage editability and ownership | lock × access × update mode × status × flow | **Medium — owners misaligned, fixed** |
+| 17 | Record page draft vs. version | `draft`, record `version` | **High — fixed** (drafts were silently lost) |
+| 18 | Records table selection | `rowSelection` vs. query | **Medium — fixed** |
+| 19 | Inspector local copies | colour / video inputs vs. definition | Low — fixed |
 
 ---
 
@@ -31,176 +38,189 @@ hit · **Low** = hygiene.
 ```mermaid
 stateDiagram-v2
   [*] --> waiting
-  waiting --> active: previous stages done/skipped
-  waiting --> skipped: reached, applicableWhen false
-  active --> done: completion conditions / Mark done
-  skipped --> active: data changes so applicableWhen becomes true
-  active --> waiting: an EARLIER skipped stage re-activates
+  waiting --> active: earlier stages done / skipped
+  waiting --> skipped: reached, condition or Depends-on path false, or jumped over
+  active --> done: Mark done / conditions met / document generated (auto doc step)
+  active --> skipped: data changed so it no longer applies
+  done --> waiting: backward Stage Jump reopens it (round + 1)
+  skipped --> [*]
   done --> [*]
 ```
 
-The status is recomputed from scratch on every write and every 5-minute sweep; transitions are
-whatever the diff against the previous run happens to be. Events are only emitted for
-`→ active`, `→ skipped` and `→ done`.
+**Decision taken (was open):** a skip is **final once the flow has moved past it** — a later stage was
+reached or the record finished. Before, editing a field could turn an earlier skipped stage back to
+`active`, push the current stage back to `waiting`, wipe its planned time and send nothing (and its
+hand-off would never be re-sent). This matches the legacy FMS, where conditional stages were decided
+once when reached. Reopening is explicit: a backward Stage Jump (`stage_reopened` event, owners
+notified again). Test: `core/test/stage-settings.test.ts` "a skipped stage stays skipped…".
 
-* **Silent regression.** Stage 3 skipped, record moves on to stage 4. Someone edits a field so
-  stage 3 now applies: stage 3 becomes `active`, stage 4 drops back to `waiting` and its planned
-  time is wiped — with no event and no audit entry. When stage 4 activates again, its hand-off is
-  **not** re-sent because the `handoff:<record>:<stage>` marker already exists
-  (`apps/worker/src/jobs/record-changed.ts`). Decide the policy: either freeze a skip once a later
-  stage started (legacy-like), or emit a `stage_reverted` event and key hand-offs per activation.
-* `done` is terminal; there is no reopen (roadmap item "stage reopen").
+## 2. Record lifecycle
 
-## 2. Record lifecycle — `apps/api/src/services/records.ts`
+`open` (`currentStageKey` set) → `completed` (`completedAt`); `archived` is orthogonal. With #1 fixed,
+`completed → open` only happens through a backward jump (which needs the source stage to complete, so
+in practice never after completion). `version` is the optimistic-lock counter (see #17).
 
-States: `open` (`currentStageKey` set) → `completed` (`completedAt` set when no stage is active);
-`archived` is orthogonal (`archivedAt`). `completed → open` happens implicitly through the
-regression above (`completedAt` is cleared by the sweep). Archived records are excluded from the
-sweep and rejected by `loadForWrite`, so archiving freezes the timeline; restoring resumes it.
-`version` is a separate optimistic-lock counter. Low risk; worth a named `status` column if
-reporting needs it.
+## 3. Flow lifecycle — `isDraft × isActive × deletedAt`
 
-## 3. Flow lifecycle — three independent columns
-
-`isDraft × isActive × deletedAt` = 8 combinations, of which the product talks about four
-(Draft, Active, Inactive, In trash):
-
-| isDraft | isActive | deletedAt | Meaning | Reachable |
+| State | isDraft | isActive | deletedAt | How you get there |
 |---|---|---|---|---|
-| true | true | – | Draft | create, duplicate, template |
-| true | false | – | "inactive draft" — undefined | yes, `PATCH /flows/:key {isActive:false}` on a draft |
-| false | true | – | Live | publish |
-| false | false | – | Inactive | deactivate |
-| any | any | set | In trash (remembers the rest for restore) | trash |
+| Draft | true | true | – | All Flows › Create, template, duplicate, **form editor › New** |
+| Live | false | true | – | Publish (flow editor) |
+| Inactive (read-only) | false | false | – | Deactivate on All Flows or in the form editor |
+| In trash | any | any | set | Trash (restore keeps the rest) |
 
-* **"Inactive (read-only)" is not read-only.** The form editor labels it so, but only
-  `createSubmission` checks `isActive`; `updateRecord`, `completeStage` and archive still work
-  (`records.ts` — `loadForWrite` checks `archivedAt` only).
-* Drafts accept new records through the API (`isActive` is true), though the UI hides "Add entry"
-  and the worker ignores drafts. Fine for testing, but it should be a decision, not an accident.
-* Recommendation: one `status` enum (`draft | live | inactive`) plus `deletedAt`, with transitions
-  in one service function.
+* Inactive flows are read-only (edits, completion, planning, document generation rejected).
+* Drafts are visible to admins only (`workflowFor`); the worker ignores drafts and inactive flows.
+* **Fixed 2026-11-23:** the form editor bypassed the lifecycle — `POST /workflows` created a flow that
+  was live at once, and `PUT /workflows/:wf/definition` could set a draft "inactive" (the undefined
+  "inactive draft" state). Now it creates drafts, rejects the switch on drafts, and its UI shows
+  "Draft — publish in the flow editor" / "Save draft".
 
-## 4. Organization access — `orgAccessError` in `packages/core/src/permissions.ts`
+## 4–7
 
-`ACTIVE`, `SUSPENDED`, `LICENSE_EXPIRED` derived from two columns. The `ACTIVE → LICENSE_EXPIRED`
-transition is **time-based** — nothing happens at the moment of expiry; every request re-checks,
-so access is still closed correctly. Explicit suspension revokes refresh tokens; expiry does not
-(harmless, refresh re-checks). Low risk — this one is already centralised.
+Unchanged and fine: organization access is derived in one place (`orgAccessError`); lockout restarts
+its count when a lock expires; refresh-token rotation is atomic with a 15-second grace for tab races;
+the super admin's acting organization is bound into the access token.
 
-## 5. User account and lockout — `apps/api/src/routes/auth.ts`
+## 8. Delivery — `apps/worker/src/notify.ts`
 
 ```mermaid
 stateDiagram-v2
-  [*] --> ok
-  ok --> counting: wrong password (failedLogins++)
-  counting --> locked: failedLogins >= 5 (lockedUntil = +15 min)
-  locked --> counting: time passes (implicit)
-  counting --> ok: correct password (reset to 0)
-```
-
-* **Lockout never decays.** When `lockedUntil` passes, `failedLogins` is still 5, so the *first*
-  wrong password afterwards locks the account again for 15 minutes. Reset the counter when a lock
-  expires (or count failures in a sliding window).
-* `isActive=false` and `locked` are independent; disabling does not clear the counter (fine).
-
-## 6. Session / refresh token — `apps/api/src/routes/auth.ts` (`/refresh`)
-
-`active → rotated (revokedAt) → reuse detected → whole family revoked`, plus `expired` and
-`logged out`.
-
-* **Rotation race (High).** Rotation is read-then-update, not atomic, and the browser cookie is
-  shared across tabs. Two tabs refreshing together either both succeed (forking the family) or the
-  second presents the just-rotated token and is treated as theft — **every session of that user is
-  revoked**. The client's single-flight (`refreshSession` in `apps/web/src/lib/api.ts`) only
-  protects one tab. Fix: rotate with `updateMany({ where: { id, revokedAt: null } })` and check the
-  count, and accept a token rotated in the last ~10 s as a benign race (return the successor)
-  instead of revoking the family.
-
-## 7. Super admin context
-
-`home` ↔ `visiting(org)` via `User.activeOrgId`, mirrored in the JWT `org` claim. Old tokens are
-rejected by the mismatch check and the client refreshes into the new organization. Demotion resets
-`activeOrgId`. Consistent; the only implicit part is that the token and the column must agree,
-which `authenticate` enforces (reloading once on mismatch for multi-node caches).
-
-## 8. Notification delivery — `apps/worker/src/notify.ts`
-
-```mermaid
-stateDiagram-v2
-  [*] --> pending: claim(dedupeKey) — unique insert
+  [*] --> pending: claim(dedupeKey)
   pending --> sent
-  pending --> failed: channel threw
-  pending --> skipped: no recipients / WhatsApp not configured
+  pending --> failed: channel / endpoint error
+  pending --> skipped: no recipients / channel not configured
+  failed --> pending: re-claimed after back-off (5, 10, 20, 40 min), < 5 attempts
+  pending --> pending: stale > 10 min (crashed worker) re-claimed
 ```
 
-The unique `dedupeKey` row *is* the state, and "exists" means "never try again".
+**Fixed 2026-11-23:** webhooks were not part of this machine. A failure threw, BullMQ retried for about
+two minutes and the delivery was then lost with no trace (only successes were logged). Webhooks now
+`claim` like every other delivery, record `failed` with the error, and are retried by the sweep with
+the same back-off. Blocked (private-network) URLs fail once with attempts exhausted.
 
-* **Failures are permanent (High).** A transient SMTP outage marks the row `failed`; the next run
-  sees the key and skips it, so the message is never delivered. Allow `failed → pending` retries
-  with a back-off and an attempt counter.
-* **Crashes strand messages (High).** If the worker dies between `claim` and `settle`, the
-  per-recipient row stays `pending` forever. The sweep only reaps stale `handoff-marker` rows
-  (`apps/worker/src/jobs/periodic.ts`), so on retry the marker is re-claimed but every stranded
-  recipient is skipped. Reap stale `pending` rows of all kinds, not just markers.
+## 9–10, 12
 
-## 9. Background job runs — `apps/worker/src/index.ts`
+Unchanged: stale `running` job rows are closed by the sweep; the offline mock is development-only and
+never replaces a real API answer; sidebar state is low-risk local UI.
 
-`running → succeeded | failed`. A crash or deploy mid-job leaves the row `running` forever, and
-the Audit page shows it as in progress. BullMQ retries create a new row per attempt. Add a reaper
-(`running` older than N minutes → `failed: interrupted`).
+## 11. Flow editor UI — `apps/web/src/pages/flows/editor`
 
-## 10. Client auth session — `apps/web/src/lib/auth.tsx`, `api.ts`
+Explicit reducers (`machines.ts`, unit-tested): panel `closed | node(id) | settings`; save
+`idle | saving | saved | failed` (a save can not start while one is in flight). Added since:
 
-Five pieces of state: React `status` (`loading | authenticated | anonymous`) and `user`, plus
-module-level `accessToken`, `refreshing` (single-flight promise) and `isMockAuth`.
+* **Preview** (`previewId`): could point at a node that was deleted, and pop up again when an undo
+  restored it. Now cleared as soon as its node is gone.
+* **Shortcuts under dialogs:** with the preview or a large field editor open, Esc also closed the side
+  panel and undo / delete changed the canvas behind the dialog. Shortcuts now stand down while a
+  dialog is open (Ctrl+S still saves).
+* **Panel width:** `panelWidth` (persisted, clamped to 340 px … 75 % of the window) + `resizing`
+  (no width animation while dragging); "wide" layout derives from the width, not a separate flag.
+* **Selection vs. panel (2026-11-24):** selection no longer drives the panel. Before, React Flow
+  selected a step when a drag started, and `onSelectionChange` then opened its settings — so moving or
+  merely touching a step opened them. Now: a click (≤ 5 px of movement) only selects and shows the
+  step's toolbar (Settings · Preview · Delete); the panel opens by the toolbar / header gear button,
+  double-click or Enter; a click switches the panel only while it is already open on a step. Drags
+  start after 5 px, do not select, and snap to neighbouring steps' edges / centres with guide lines.
+* **Restore from history:** loads a version into the editor as an ordinary (undoable) edit; the
+  snapshot also carries `settings` and `restoredFrom`, so Undo reverts a restore completely and the
+  next save is recorded as "Restored from vN".
 
-* **Mock mode latches (Medium).** Any failed login (including a wrong password against a real
-  API) sets `isMockAuth = true`; from then on every call is served by the mock for the life of the
-  tab, even when the backend is reachable. It is also compiled into production builds. Gate it
-  behind `import.meta.env.DEV` and model it as its own state (`mock` vs `live`) instead of a
-  side-flag.
-* `status='authenticated'` with `accessToken=null` is possible briefly after a 401 — handled by the
-  refresh-and-retry path, so harmless.
+## 13. Theme — `apps/web/src/lib/theme.ts`
 
-## 11. Flow editor UI — fixed
+`light | dark | system` × OS preference → `<html data-theme>`.
 
-Was: `selectedId`, `inspectorOpen` and `busy` as separate `useState`s — a selected node with a
-hidden inspector was representable, and **Ctrl+S during a save started a second concurrent PUT**.
+* **Fixed:** the theme was applied by a hook inside the sidebar layout only. Pages rendered outside it
+  — the **flow editor**, **login** and the **public form** — ignored the user's choice when opened
+  directly (e.g. "Light" on a dark OS showed dark). Toasts were always light. Now one store applies the
+  theme before the first paint on every page, follows OS changes live in `system` mode, and the toast
+  container reads the same store.
 
-Now two reducers in `apps/web/src/pages/flows/editor/machines.ts`, unit-tested in
-`apps/web/test/editorMachines.test.ts`:
+## 14. Document step
 
-* Panel: `closed | node(id) | settings`, events `SELECT, DESELECT, TOGGLE_SETTINGS, CLOSE, REMOVED`.
-  Closed by default; opens when a node is selected; canvas click / Esc closes it.
-* Save: `idle | saving(publish) | saved(version) | failed`; `START` is ignored while saving and late
-  results that don't belong to a save are dropped.
+```mermaid
+stateDiagram-v2
+  [*] --> waiting
+  waiting --> active_empty: previous stage done
+  active_empty --> active_file: generated after the write (API) / "Generate document"
+  active_empty --> active_empty: generation failed (save still succeeds)
+  active_file --> active_file: "Generate again"
+  active_file --> done: review on: "Approve & continue" · review off: immediately
+  done --> active_empty: backward jump reopens it (file cleared)
+```
 
-Remaining implicit bits: undo/redo stacks live in refs with a force-render counter, and "dirty" is a
-JSON comparison against the last save — both fine at current sizes.
+* Rules live in one place, `normalizeDocumentStages` (completion from `requireReview`, file field
+  required), applied by the flow editor, the form editor and the API — they could drift before because
+  only the canvas compiler set them.
+* **Fixed:** a backward jump reopening an automatic document step left the old file in place, so the
+  step completed again at once with stale content. Reopened document files are now cleared
+  automatically, so the document is regenerated from the corrected data.
+* **Known gap:** documents are generated by the API after a user's write. A step that becomes active
+  through the worker (e.g. a re-published definition picked up by the sweep), or whose generation
+  failed, waits for someone to press **Generate document** on the record page. The worker can not
+  generate because local file storage lives on the API node.
 
-## 12. Sidebar and menus — `apps/web/src/components/Layout.tsx`
+## 15. Public form link
 
-`collapsed` (persisted), mobile `drawer`, per-group accordion `open`, per-group flyout `fly` (only
-meaningful while collapsed — cleared by an effect when expanding), user menu `pos`. Low risk; if it
-grows, fold into one `navUi` reducer.
+`publicForm` (on/off) × `publicFormId` × flow live (not draft, active, not trashed) × organization open.
+The link works only when all four allow it; every other combination answers the same 404 so links
+can not be probed.
+
+* Switching access off and on again restores the same link (stated in the editor); **New link** retires it.
+* **Fixed:** ids were generated in the browser and could be copied between flows through the JSON
+  editor; the public route would then pick one of the two flows arbitrarily. The server now owns
+  uniqueness (`ensurePublicFormId` on every save path) and the editor adopts the id it returns.
+  Duplicates and template copies start private.
+
+## 16. Stage editability and ownership
+
+Whether a user may edit a stage's fields is the product of: stage status (reached?), **Lock after
+completion** (done → read-only for everyone), **Stage Access Control** (Viewer / Editor / not listed),
+**Single item update** (off → bulk tool only, admins exempt), record archived, flow inactive, and the
+field's own rules. The server (`applyChange`) and the record page (`stageBlock`) implement the same
+list and show the reason.
+
+**Fixed — who works on a stage was decided three different ways.** With Stage Access Control on, the
+API let assigned Editors fill in fields but completing still required the owner *group*, while My
+Tasks, the "my tasks" filter, hand-offs, reminders and digests went to the group — so group members got
+tasks and emails for stages they could not open, and assigned Editors outside the group never heard
+about theirs. Now one rule, `worksOnStage` (core): assigned Editors when restricted, owner groups
+otherwise; `canActOnStage` adds the admin override. Used by My Tasks, the list filter, `isMine`,
+completion, planning, document regeneration and every worker notification.
+
+**Shown on the record page (2026-11-24):** the record reads as a run of its flow — every step with
+its status, who works on it (assigned editors or owner groups) and the viewer's access (fill in / view
+only / no access, from the server's `canView` / `canEdit` / `canAct`), the chosen step's timings and
+deliveries (admins: failed messages with how to fix them), and what comes next. After a step is
+completed (by Mark done, or by a save that meets its conditions) the page follows the record to the
+new current step and says who has it now.
+
+**Dependent dropdowns (2026-11-24):** a changed parent clears child values it no longer offers, down
+the chain (`staleDependents`, core), in every form and again on the server for fields the user can not
+edit. Only children below the edited field are touched, so values from an older option list survive
+unrelated edits. Definitions must depend on a dropdown in the same or an earlier stage, never in a
+loop, and a header field can not depend on a repeating-row field.
+
+## 17. Record page draft vs. record version
+
+The draft was keyed to the record version: any refetch with a new version (another user's change,
+returning to the tab) re-mounted the page and **silently discarded what the user had typed**. Now the
+draft remembers the version it started from: untouched drafts rebase quietly; typed drafts are kept,
+a banner offers **Reload**, and saving sends the original version so the server answers 409 instead of
+overwriting the other change.
+
+## 18. Records table selection
+
+`rowSelection` survived page, filter, sort and status changes, so **Archive** or **Bulk update** could
+act on records no longer on screen. The selection now resets whenever the query changes.
+
+## 19. Inspector local copies
+
+The header-colour and instruction-video inputs keep local text while typing (a half-typed link is not
+saved). They did not follow undo / redo; they now resync when the stored value changes.
 
 ---
 
-## Status (2026-11-19)
-
-| # | Fix | Where |
-|---|---|---|
-| 8 | **Fixed.** `failed` deliveries are re-claimed with back-off (5/10/20/40 min, max 5 attempts) and `pending` rows older than 10 min (crashed sends) are re-claimed; the conditional update makes re-claims atomic across workers. Hand-off markers with failed deliveries stay `failed`, so the hand-off is retried and only the unreached recipients are resent. The sweep reprocesses records with retryable deliveries. | `apps/worker/src/notify.ts` (`claim`, `isRetryable`), `jobs/periodic.ts` |
-| 6 | **Fixed.** Rotation is an atomic conditional update; a token rotated < 15 s ago returns `409 REFRESH_RACE` (no family revocation) and the client retries once with the new cookie. | `apps/api/src/routes/auth.ts`, `apps/web/src/lib/api.ts` |
-| 3 | **Fixed.** Inactive flows are read-only (edits, stage completion, re-planning rejected; archiving still allowed). `isActive` can no longer be toggled on a draft — drafts go live by publishing. | `services/records.ts` (`loadForWrite`), `routes/flows.ts` |
-| 5 | **Fixed.** An expired lock starts a fresh failure count. | `routes/auth.ts` |
-| 9 | **Fixed.** The sweep closes runs left `running` for > 30 min as `failed: interrupted`. | `jobs/periodic.ts` |
-| 10 | **Fixed.** The offline mock runs only in development (or with `VITE_ENABLE_MOCK=true`) and only when the API is unreachable — a real `401` is never replaced by mock data. | `apps/web/src/lib/api.ts` |
-| 11 | **Fixed** earlier (panel / save reducers). | `editor/machines.ts` |
-| 1 | **Open — needs a product decision.** Stage regression (an earlier skipped stage re-activating) still sends no event and does not re-send the later stage's hand-off. | `core/timeline.ts` |
-
-New since the audit:
-
-* **Depends-on paths** (`stage.guards`, switch form) are evaluated by the same `stageApplies()` as `applicableWhen`, so they inherit #1's behaviour.
-* **Stage Jump** adds two explicit transitions to the stage machine: `pending → skipped` for stages a forward jump passes over, and `done → active` (round + 1) for the range a backward jump reopens. Backward jumps fire only on the source stage's transition to `done`, are capped at `MAX_ROUNDS = 20`, and emit `stage_reopened`, so the reopened owners are re-notified — unlike the regression in #1.
+Also aligned while auditing: record lists, reports and My Tasks show times in the flow's business
+timezone like the record page (they used the browser's); dates use one format; a datetime default of
+`TODAY` means the start of the day in the browser as on the server; Connections uses the shared switch.

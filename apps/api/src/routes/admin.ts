@@ -7,7 +7,7 @@ import type { AuthUser } from '../plugins/auth.js';
 import { audit } from '../lib/audit.js';
 import { AppError, parse } from '../lib/errors.js';
 import { assertSeatAvailable } from '../lib/license.js';
-import { enqueueManualJob } from '../lib/queue.js';
+import { enqueueManualJob, publishRecordChanged } from '../lib/queue.js';
 import { getWorkflow, invalidateWorkflow } from '../lib/workflows.js';
 import { invalidatePrincipal } from '../plugins/auth.js';
 import { passwordSchema } from './auth.js';
@@ -261,8 +261,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     const { recordIds } = parse(z.object({ recordIds: z.array(z.string().min(1)).min(1).max(500) }), req.body);
     const wf = await getWorkflow(req.principal.orgId, key);
     if (!(await prisma.notificationRule.count({ where: { id, workflowId: wf.id } }))) throw AppError.notFound('Rule');
-    const { count } = await prisma.notificationLog.deleteMany({ where: { ruleId: id, recordId: { in: recordIds } } });
-    return { cleared: count };
+    // Only records of this flow; then re-run them so the rule fires again where its trigger still holds.
+    const records = await prisma.record.findMany({ where: { id: { in: recordIds }, workflowId: wf.id }, select: { id: true } });
+    const ids = records.map((r) => r.id);
+    const { count } = await prisma.notificationLog.deleteMany({ where: { ruleId: id, recordId: { in: ids } } });
+    await publishRecordChanged(ids);
+    await audit(prisma, { orgId: wf.orgId, actor: req.principal, action: 'rule.resent', entityType: 'NotificationRule', entityId: id, diff: { records: ids.length }, ip: req.ip });
+    return { cleared: count, records: ids.length };
   });
 
   // ------------------------------------------------------------ audit & jobs

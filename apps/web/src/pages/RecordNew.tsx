@@ -2,8 +2,8 @@ import { Copy, Plus, Trash2 } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
-import type { FieldValue } from '@fms/core';
-import { FieldInput, fieldDefaults } from '../components/FieldInput';
+import { staleDependents, type FieldValue } from '@fms/core';
+import { changeWithDependents, FieldInput, fieldDefaults } from '../components/FieldInput';
 import { StageIntro } from '../components/StageIntro';
 import { Button, Card, ErrorNote, FormField, PageHeader, Spinner } from '../components/ui';
 import { api, ApiError } from '../lib/api';
@@ -77,7 +77,14 @@ export default function RecordNew() {
     }
   }
 
-  const setItem = (i: number, key: string, v: FieldValue) => setItems((arr) => arr.map((it, j) => (j === i ? { ...it, [key]: v } : it)));
+  // Changing a dropdown clears dependent dropdowns below it that no longer fit — in the header and,
+  // for a header parent, in every repeating row.
+  const setItem = (i: number, key: string, v: FieldValue) => setItems((arr) => arr.map((it, j) => (j === i ? changeWithDependents(intakeFields, it, key, v, { context: header }) : it)));
+  const setHead = (key: string, v: FieldValue) => {
+    const next = changeWithDependents(intakeFields, header, key, v);
+    setHeader(next);
+    if (itemFields.some((f) => f.type === 'dependent-select')) setItems((arr) => arr.map((it) => ({ ...it, ...staleDependents(itemFields, { ...next, ...it }, [key]) })));
+  };
 
   return (
     <form onSubmit={submit} className="mx-auto max-w-5xl space-y-4">
@@ -105,7 +112,7 @@ export default function RecordNew() {
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {headerFields.map((f) => (
             <FormField key={f.key} label={f.label} required={f.required} error={errors[f.key]} hint={f.helpText} className={f.type === 'textarea' ? 'md:col-span-2' : undefined}>
-              <FieldInput field={f} value={header[f.key]} onChange={(v) => setHeader((h) => ({ ...h, [f.key]: v }))} disabled={!f.canEdit} zone={wf.timezone} data={header} invalid={!!errors[f.key]} />
+              <FieldInput field={f} value={header[f.key]} onChange={(v) => setHead(f.key, v)} disabled={!f.canEdit} zone={wf.timezone} data={header} invalid={!!errors[f.key]} />
             </FormField>
           ))}
         </div>

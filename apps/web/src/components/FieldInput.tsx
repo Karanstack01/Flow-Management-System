@@ -3,10 +3,14 @@ import { Paperclip, Upload, X } from 'lucide-react';
 import { DateTime } from 'luxon';
 import { useId, useState } from 'react';
 import { toast } from 'sonner';
-import type { FieldValue } from '@fms/core';
-import { api, openFile, uploadFile } from '../lib/api';
+import { dependentOptions, staleDependents, type FieldValue } from '@fms/core';
+import { api, fileThumbnail, openFile, uploadFile } from '../lib/api';
 import type { FieldView, RecordData } from '../lib/types';
+import { SearchSelect } from './SearchSelect';
 import { Input, Select, Textarea } from './ui';
+
+/** Dropdowns with more options than this get a search box. */
+const SEARCH_FROM = 7;
 
 interface Props {
   field: FieldView;
@@ -19,6 +23,19 @@ interface Props {
   invalid?: boolean;
 }
 
+/**
+ * Set one value and clear dependent dropdowns below it that the new value no longer offers
+ * (Country → State → City). `context` holds values the form shows but does not edit (e.g. the
+ * header for a repeating row); `canClear` limits clearing to fields this form may write (the server
+ * clears the rest itself).
+ */
+export function changeWithDependents(fields: readonly FieldView[], data: RecordData, key: string, value: FieldValue, opts: { context?: RecordData; canClear?: (key: string) => boolean } = {}): RecordData {
+  const next = { ...data, [key]: value };
+  const stale = staleDependents(fields, { ...opts.context, ...next }, [key]);
+  for (const k of Object.keys(stale)) if (!opts.canClear || opts.canClear(k)) next[k] = null;
+  return next;
+}
+
 /** Form values from each field's default (`TODAY` / `NOW` for dates). Fields without one are left out. */
 export function fieldDefaults(fields: FieldView[], zone: string): RecordData {
   const out: RecordData = {};
@@ -28,7 +45,8 @@ export function fieldDefaults(fields: FieldView[], zone: string): RecordData {
     const now = DateTime.now().setZone(zone);
     const upper = d.toUpperCase();
     if (f.type === 'date') out[f.key] = upper === 'TODAY' || upper === 'NOW' ? now.toISODate() : d;
-    else if (f.type === 'datetime') out[f.key] = upper === 'NOW' || upper === 'TODAY' ? now.toUTC().toISO() : DateTime.fromISO(d, { zone }).toUTC().toISO();
+    // Same as the server (core defaultFieldValues): TODAY = start of the day, NOW = this moment.
+    else if (f.type === 'datetime') out[f.key] = upper === 'NOW' ? now.toUTC().toISO() : upper === 'TODAY' ? now.startOf('day').toUTC().toISO() : DateTime.fromISO(d, { zone }).toUTC().toISO();
     else if (f.type === 'number') out[f.key] = Number.isFinite(Number(d)) ? Number(d) : null;
     else if (f.type === 'checkbox') out[f.key] = ['true', 'yes', '1', 'on'].includes(d.toLowerCase());
     else if (f.type === 'multiselect') out[f.key] = d.split(',').map((x) => x.trim()).filter(Boolean);
@@ -67,11 +85,13 @@ export function FieldInput({ field, value, onChange, disabled, zone, data, inval
     case 'checkbox':
       return (
         <label className="inline-flex h-9 items-center gap-2 text-sm">
-          <input type="checkbox" className="size-4 accent-[var(--color-primary)]" disabled={disabled} checked={value === true} onChange={(e) => onChange(e.target.checked)} />
+          <input type="checkbox" disabled={disabled} checked={value === true} onChange={(e) => onChange(e.target.checked)} />
           {value === true ? 'Yes' : 'No'}
         </label>
       );
     case 'select':
+      // Long lists get a search box (legacy dropdown-search).
+      if ((field.options?.length ?? 0) > SEARCH_FROM) return <SearchSelect options={field.options ?? []} value={str || null} onChange={(v) => onChange((v as string | null) ?? null)} placeholder={field.placeholder} disabled={disabled} invalid={invalid} aria-label={field.label} />;
       return (
         <Select {...common} value={str} onChange={(e) => onChange(e.target.value || null)}>
           <option value="">{field.placeholder || '— Select —'}</option>
@@ -83,17 +103,27 @@ export function FieldInput({ field, value, onChange, disabled, zone, data, inval
         </Select>
       );
     case 'dependent-select': {
-      const parent = field.dependsOn ? String(data?.[field.dependsOn] ?? '') : '';
-      const options = field.optionMap?.[parent] ?? [];
+      const parentValue = field.dependsOn ? data?.[field.dependsOn] : undefined;
+      const parent = parentValue === null || parentValue === undefined ? '' : String(parentValue).trim();
+      const options = dependentOptions(field, parent);
+      const parentName = field.dependsOnLabel ? `“${field.dependsOnLabel}”` : 'the field it depends on';
+      // A stored value from an older option list is still shown (and can be changed), not blanked.
+      const legacy = str && !options.includes(str);
+      const hint = !parent ? `Choose ${parentName} first` : !options.length ? `No choices for “${parent}”` : null;
+      if (!hint && !legacy && options.length > SEARCH_FROM) return <SearchSelect options={options} value={str || null} onChange={(v) => onChange((v as string | null) ?? null)} placeholder={field.placeholder} disabled={disabled} invalid={invalid} aria-label={field.label} />;
       return (
-        <Select {...common} disabled={disabled || !parent} value={str} onChange={(e) => onChange(e.target.value || null)}>
-          <option value="">{parent ? '— Select —' : 'Choose the parent field first'}</option>
-          {options.map((o) => (
-            <option key={o} value={o}>
-              {o}
-            </option>
-          ))}
-        </Select>
+        <>
+          <Select {...common} disabled={disabled || (!parent && !str) || (!options.length && !str)} value={str} onChange={(e) => onChange(e.target.value || null)}>
+            <option value="">{hint ?? (field.placeholder || '— Select —')}</option>
+            {legacy && <option value={str}>{str} (not offered for “{parent || '—'}”)</option>}
+            {options.map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </Select>
+          {hint && !disabled && <span className="mt-1 block text-[11px] text-muted">{hint}</span>}
+        </>
       );
     }
     case 'combobox':
@@ -104,7 +134,7 @@ export function FieldInput({ field, value, onChange, disabled, zone, data, inval
         </>
       );
     case 'multiselect':
-      return <MultiSelect options={field.options ?? []} value={Array.isArray(value) ? value : []} onChange={onChange} disabled={disabled} placeholder={field.placeholder} />;
+      return <SearchSelect multiple options={field.options ?? []} value={Array.isArray(value) ? value : []} onChange={(v) => onChange(Array.isArray(v) ? v : [])} disabled={disabled} invalid={invalid} placeholder={field.placeholder} aria-label={field.label} />;
     case 'file':
       return <FileInput value={Array.isArray(value) ? value : []} onChange={onChange} disabled={disabled} multiple={!!field.allowMultiple} label={field.placeholder} />;
     case 'user-email':
@@ -115,34 +145,27 @@ export function FieldInput({ field, value, onChange, disabled, zone, data, inval
   }
 }
 
-function MultiSelect({ options, value, onChange, disabled, placeholder }: { options: string[]; value: string[]; onChange: (v: string[]) => void; disabled?: boolean; placeholder?: string }) {
-  const remaining = options.filter((o) => !value.includes(o));
+/** Image files show as a small picture (legacy image columns, Settings AE83); click opens it. */
+export function FileThumb({ id, size = 40 }: { id: string; size?: number }) {
+  const meta = useQuery({ queryKey: ['file', id], queryFn: () => api<{ name: string; size: number; mimeType?: string }>(`/files/${id}/meta`), staleTime: Infinity });
+  const isImage = meta.data?.mimeType?.startsWith('image/');
+  const src = useQuery({ queryKey: ['file-thumb', id], queryFn: () => fileThumbnail(id), enabled: !!isImage, staleTime: Infinity });
+  if (!isImage) return <FileChip id={id} />;
   return (
-    <div className="input flex min-h-9 flex-wrap items-center gap-1 py-1">
-      {value.map((v) => (
-        <span key={v} className="inline-flex items-center gap-1 rounded bg-primary-soft px-1.5 py-0.5 text-xs text-primary">
-          {v}
-          {!disabled && (
-            <button type="button" aria-label={`Remove ${v}`} onClick={() => onChange(value.filter((x) => x !== v))}>
-              <X className="size-3" />
-            </button>
-          )}
-        </span>
-      ))}
-      {!disabled && remaining.length > 0 && (
-        <select className="min-w-24 flex-1 bg-transparent text-sm outline-none" value="" onChange={(e) => e.target.value && onChange([...value, e.target.value])}>
-          <option value="">{placeholder || 'Add…'}</option>
-          {remaining.map((o) => (
-            <option key={o}>{o}</option>
-          ))}
-        </select>
-      )}
-    </div>
+    <button
+      type="button"
+      title={meta.data?.name}
+      onClick={(e) => (e.stopPropagation(), openFile(id).catch((err: Error) => toast.error(err.message)))}
+      className="shrink-0 overflow-hidden rounded-lg border border-line bg-surface-2 transition-transform duration-200 hover:scale-105"
+      style={{ width: size, height: size }}
+    >
+      {src.data ? <img src={src.data} alt={meta.data?.name ?? 'Image'} className="size-full object-cover" /> : <span className="block size-full animate-pulse" />}
+    </button>
   );
 }
 
 export function FileChip({ id, onRemove }: { id: string; onRemove?: () => void }) {
-  const { data } = useQuery({ queryKey: ['file', id], queryFn: () => api<{ name: string; size: number }>(`/files/${id}/meta`), staleTime: Infinity });
+  const { data } = useQuery({ queryKey: ['file', id], queryFn: () => api<{ name: string; size: number; mimeType?: string }>(`/files/${id}/meta`), staleTime: Infinity });
   return (
     <span className="inline-flex max-w-64 items-center gap-1 rounded border border-line bg-surface-2 px-2 py-1 text-xs">
       <Paperclip className="size-3 shrink-0" />
@@ -176,7 +199,14 @@ function FileInput({ value, onChange, disabled, multiple, label }: { value: stri
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {value.map((id) => (
-        <FileChip key={id} id={id} onRemove={disabled ? undefined : () => onChange(value.filter((x) => x !== id))} />
+        <span key={id} className="inline-flex items-center gap-1">
+          <FileThumb id={id} size={44} />
+          {!disabled && (
+            <button type="button" aria-label="Remove attachment" className="grid size-6 place-items-center rounded-full text-muted hover:bg-surface-2 hover:text-danger" onClick={() => onChange(value.filter((x) => x !== id))}>
+              <X className="size-3.5" />
+            </button>
+          )}
+        </span>
       ))}
       {!disabled && (
         <label className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border border-dashed border-line px-2.5 text-xs text-muted hover:bg-surface-2">

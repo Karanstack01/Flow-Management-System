@@ -47,7 +47,10 @@ export function conditionSql(c: Condition): Prisma.Sql {
       return Prisma.sql`NOT ${eqSql(c.field, c.value)}`;
     case 'in': {
       const list = (Array.isArray(c.value) ? c.value : String(c.value ?? '').split(',')).map((v) => v.trim().toLowerCase());
-      return Prisma.sql`(lower(trim(coalesce(${text(c.field)}, ''))) = ANY(${list}::text[]))`;
+      // Multi-select values are arrays: any element in the list counts.
+      return Prisma.sql`(lower(trim(coalesce(${text(c.field)}, ''))) = ANY(${list}::text[]) OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(${json(c.field)}) = 'array' THEN ${json(c.field)} ELSE '[]'::jsonb END) AS e(v)
+        WHERE lower(trim(e.v)) = ANY(${list}::text[])))`;
     }
     case 'gt':
     case 'gte':
@@ -79,6 +82,8 @@ export interface ListQuery {
   limit: number;
   offset: number;
   numericKeys: string[];
+  /** Columns on screen that also get "filled" and "unique" counts (legacy footer: count / unique). */
+  countKeys?: string[];
 }
 
 export function whereSql(q: ListQuery): Prisma.Sql {
@@ -136,12 +141,35 @@ export function listSql(q: ListQuery): Prisma.Sql {
     LIMIT ${q.limit} OFFSET ${q.offset}`;
 }
 
-/** Count + sum/avg of every visible numeric field over the whole filtered set (legacy footer labels). */
+/**
+ * Footer totals over the whole filtered set (legacy column footers: count / sum / unique / average):
+ * sum, average, min and max of every visible numeric field, and filled / unique counts of the
+ * columns on screen.
+ */
 export function aggregateSql(q: ListQuery): Prisma.Sql {
   const cols = q.numericKeys.flatMap((k, i) => [
     Prisma.sql`sum(${numeric(k)}) AS ${Prisma.raw(`"sum_${i}"`)}`,
     Prisma.sql`avg(${numeric(k)}) AS ${Prisma.raw(`"avg_${i}"`)}`,
+    Prisma.sql`min(${numeric(k)}) AS ${Prisma.raw(`"min_${i}"`)}`,
+    Prisma.sql`max(${numeric(k)}) AS ${Prisma.raw(`"max_${i}"`)}`,
   ]);
+  for (const [i, k] of (q.countKeys ?? []).entries()) {
+    cols.push(Prisma.sql`(count(*) FILTER (WHERE NOT ${emptySql(k)}))::int AS ${Prisma.raw(`"filled_${i}"`)}`);
+    cols.push(Prisma.sql`count(DISTINCT nullif(lower(trim(coalesce(${text(k)}, ''))), ''))::int AS ${Prisma.raw(`"unique_${i}"`)}`);
+  }
   const select = cols.length ? Prisma.sql`count(*)::int AS "count", ${Prisma.join(cols, ', ')}` : Prisma.sql`count(*)::int AS "count"`;
   return Prisma.sql`SELECT ${select} FROM "Record" r WHERE ${whereSql(q)}`;
+}
+
+/** The most used values of one field (column filter lists), over the records the user may see. */
+export function distinctValuesSql(workflowId: string, key: string, rowFilter: ConditionGroup | null, archived: boolean): Prisma.Sql {
+  return Prisma.sql`
+    SELECT x.v AS "value", count(*)::int AS "count" FROM (
+      SELECT CASE WHEN jsonb_typeof(${json(key)}) = 'array' THEN e.v ELSE ${text(key)} END AS v
+      FROM "Record" r
+      LEFT JOIN LATERAL jsonb_array_elements_text(CASE WHEN jsonb_typeof(${json(key)}) = 'array' THEN ${json(key)} ELSE '[]'::jsonb END) AS e(v) ON TRUE
+      WHERE r."workflowId" = ${workflowId} AND ${archived ? Prisma.sql`r."archivedAt" IS NOT NULL` : Prisma.sql`r."archivedAt" IS NULL`} AND ${groupSql(rowFilter)}
+    ) x
+    WHERE x.v IS NOT NULL AND trim(x.v) <> ''
+    GROUP BY x.v ORDER BY count(*) DESC, x.v LIMIT 200`;
 }

@@ -91,9 +91,10 @@ export function TrendChart({ data }: { data: { date: string; created: number; co
               </text>
             ) : null,
           )}
-          {SERIES.map((s) => (
+          {SERIES.map((s, si) => (
             <g key={s.key}>
-              <path d={area(s.key)} fill={`url(#fill-${s.key})`} />
+              {/* One soft fill (the first series): two overlapping fills blend into a muddy grey. */}
+              {si === 0 && <path d={area(s.key)} fill={`url(#fill-${s.key})`} />}
               <path d={path(s.key)} fill="none" stroke={s.color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
             </g>
           ))}

@@ -114,5 +114,9 @@ All endpoints are under `/api/v1` and need `Authorization: Bearer <token>` excep
 | `POST /files` · `GET /files/:id` | Attachments |
 | `/admin/users` · `/admin/groups` · `/admin/calendars` · `/admin/option-sets` · `/admin/audit` · `/admin/jobs` | Administration |
 | `POST /workflows` · `PUT /workflows/:wf/definition` · `GET …/versions` | Workflow publishing |
+| `GET …/records/values` · `POST …/records/import` · `GET/POST …/records/export-sheet` · `POST …/records/:id/items` | Column filter values, CSV import (with dry run), Google Sheets export, adding line items to a submission |
+| `GET …/records/:id/notifications` · `POST …/notifications/:logId/resend` · `GET …/reports/missing` | Deliveries per record (admins) and "Send again"; fields still empty |
+| `GET /dashboard/tiles` · `/admin/dashboard-tiles` | Dashboard quick links |
+| `GET /flows/:wf/versions` · `GET /flows/:wf/versions/:n` | Version history (who / when / how, and each version's definition, settings and canvas); restore = load into the editor and save with `restoredFrom` |
 
 Errors are JSON: `{ "error": { "code", "message", "details"? } }` — `422` carries per-field messages.

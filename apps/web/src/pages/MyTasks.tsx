@@ -70,7 +70,7 @@ export default function MyTasks() {
                     <td>
                       <Badge color={t.stageColor}>{t.stageName}</Badge>
                     </td>
-                    <td className="whitespace-nowrap">{fmtDateTime(t.plannedAt)}</td>
+                    <td className="whitespace-nowrap">{fmtDateTime(t.plannedAt, t.timezone)}</td>
                     <td className={t.overdue ? 'whitespace-nowrap font-medium text-danger' : 'whitespace-nowrap text-muted'}>{fmtHours(t.delayHours)}</td>
                   </tr>
                 ))}

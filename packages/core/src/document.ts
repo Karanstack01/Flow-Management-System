@@ -38,7 +38,7 @@ export function documentFileName(cfg: Pick<DocumentConfig, 'fileName' | 'format'
 /** Sample values for previews: field labels, numbers and today's date. */
 export function sampleRecord(fields: readonly FieldDef[]): RecordData {
   const today = new Date().toISOString().slice(0, 10);
-  return Object.fromEntries(
+  const out = Object.fromEntries(
     fields.map((f) => {
       switch (f.type) {
         case 'number':
@@ -67,5 +67,16 @@ export function sampleRecord(fields: readonly FieldDef[]): RecordData {
           return [f.key, `Sample ${f.label}`];
       }
     }),
-  );
+  ) as RecordData;
+  // A dependent dropdown takes a choice its (sample) parent really offers — down the chain.
+  for (let pass = 0; pass < fields.length; pass++) {
+    let changed = false;
+    for (const f of fields) {
+      if (f.type !== 'dependent-select' || !f.dependsOn) continue;
+      const v = f.optionMap?.[String(out[f.dependsOn] ?? '')]?.[0] ?? Object.values(f.optionMap ?? {})[0]?.[0] ?? f.label;
+      if (out[f.key] !== v) (out[f.key] = v), (changed = true);
+    }
+    if (!changed) break;
+  }
+  return out;
 }

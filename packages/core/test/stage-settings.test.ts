@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canvasFromDefinition, compileCanvas, computeTimeline, fieldAccess, reconcileCanvas, stageAccess, visibleFieldKeys, workflowDefSchema, workflowSettingsSchema, type Principal, type WorkflowDefInput } from '../src/index.js';
+import { canActOnStage, canvasFromDefinition, compileCanvas, computeTimeline, fieldAccess, normalizeDocumentStages, reconcileCanvas, stageAccess, visibleFieldKeys, workflowDefSchema, workflowSettingsSchema, worksOnStage, type Principal, type WorkflowDefInput } from '../src/index.js';
 import { calendar, ist, orderWorkflowInput } from './fixtures.js';
 
 const settings = workflowSettingsSchema.parse({});
@@ -63,6 +63,39 @@ describe('document steps', () => {
     const compiled = compileCanvas(canvas, def, settings);
     expect(compiled.errors).toEqual([]);
     expect(compiled.warnings.some((w) => w.nodeId === 'doc-old')).toBe(true);
+  });
+});
+
+describe('state machine decisions', () => {
+  it('a skipped stage stays skipped once the flow has moved past it (no silent regression)', () => {
+    const def = workflowDefSchema.parse(orderWorkflowInput);
+    const t0 = ist('2026-01-22T10:00');
+    // QC (the last stage) only applies when needs_qc is ticked: approve and dispatch without it.
+    let t = computeTimeline({ stages: def.stages, data: { approved: true }, createdAt: t0, now: t0, calendar });
+    t = computeTimeline({ stages: def.stages, data: { approved: true }, createdAt: t0, now: t0, calendar, previous: t.states.map((s) => (s.stageKey === 'dispatch' ? { ...s, actualAt: t0 } : s)) });
+    expect(t.currentStageKey).toBeNull();
+    expect(t.states.find((s) => s.stageKey === 'qc')?.status).toBe('skipped');
+    // Ticking needs_qc afterwards no longer re-opens the finished record.
+    const later = computeTimeline({ stages: def.stages, data: { approved: true, needs_qc: true }, createdAt: t0, now: t0, calendar, previous: t.states });
+    expect(later.currentStageKey).toBeNull();
+    expect(later.events).toEqual([]);
+  });
+
+  it('a back-jump that reopens a document step clears its file so it is generated again', () => {
+    const input = withDocument(false);
+    input.stages = input.stages.map((s) => (s.key === 'dispatch' ? { ...s, jumps: [{ when: { mode: 'all', conditions: [{ field: 'customer', op: 'eq', value: 'redo' }] }, to: 'quote', clearFields: [] }] } : s));
+    const def = normalizeDocumentStages(workflowDefSchema.parse(input));
+    expect(def.stages.find((s) => s.key === 'dispatch')!.jumps![0]!.clearFields).toEqual(['quote_pdf']);
+  });
+
+  it('assigned Editors replace the owner groups of a restricted stage', () => {
+    const stage = { responsibleGroups: ['MANAGER'], stageAccessRestricted: true, stageUsers: [{ email: 'ed@x.com', role: 'Editor' as const }, { email: 'vi@x.com', role: 'Viewer' as const }] };
+    expect(worksOnStage(stage, user('ed@x.com'))).toBe(true);
+    expect(worksOnStage(stage, user('vi@x.com'))).toBe(false);
+    expect(worksOnStage(stage, user('manager@x.com'))).toBe(false); // in MANAGER, but not assigned
+    expect(worksOnStage({ ...stage, stageAccessRestricted: false }, user('manager@x.com'))).toBe(true);
+    expect(canActOnStage(stage, user('boss@x.com', true))).toBe(true);
+    expect(canActOnStage({ responsibleGroups: [] }, user('anyone@x.com'))).toBe(true);
   });
 });
 

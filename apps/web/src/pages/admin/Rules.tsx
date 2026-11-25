@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { notificationRuleSchema, type NotificationRuleDef } from '@fms/core';
 import { ConditionEditor } from '../../components/ConditionEditor';
-import { Badge, Button, Card, EmptyState, FormField, Input, Modal, PageHeader, Select, Spinner, Textarea } from '../../components/ui';
+import { Badge, Button, Card, Checkbox, EmptyState, FormField, Input, Modal, PageHeader, Select, Spinner, Textarea } from '../../components/ui';
 import { api } from '../../lib/api';
 import { useWorkflow, useWorkflows } from '../../lib/queries';
 import type { WorkflowView } from '../../lib/types';
@@ -116,8 +116,10 @@ export default function RulesAdmin() {
 
 function RuleDialog({ wf, rule, onClose, onSaved }: { wf: WorkflowView; rule: RuleRow | null; onClose: () => void; onSaved: () => void }) {
   const [def, setDef] = useState<NotificationRuleDef>(
-    rule?.definition ?? { name: 'New rule', isActive: true, trigger: { type: 'stage_activated', stageKey: wf.stages[1]?.key ?? wf.stages[0]!.key }, email: { to: '{{customer_email}}', subject: 'Update on #{{record_number}}', body: 'Hello {{customer}},\n\nYour request is now at {{current_stage}}.' } },
+    // Older stored rules get today's defaults (e.g. no attachments) before they are edited.
+    (rule && (notificationRuleSchema.safeParse(rule.definition).data ?? rule.definition)) ?? { name: 'New rule', isActive: true, trigger: { type: 'stage_activated', stageKey: wf.stages[1]?.key ?? wf.stages[0]!.key }, email: { to: '{{customer_email}}', subject: 'Update on #{{record_number}}', body: 'Hello {{customer}},\n\nYour request is now at {{current_stage}}.', attachments: [] } },
   );
+  const fileFields = wf.fields.filter((f) => f.type === 'file');
   const [busy, setBusy] = useState(false);
   const fields = wf.fields.map((f) => ({ key: f.key, label: f.label, options: f.options }));
   const check = notificationRuleSchema.safeParse(def);
@@ -183,7 +185,7 @@ function RuleDialog({ wf, rule, onClose, onSaved }: { wf: WorkflowView; rule: Ru
 
         <fieldset className="space-y-3 rounded-md border border-line p-3">
           <label className="inline-flex items-center gap-2 text-sm font-medium">
-            <input type="checkbox" checked={!!def.email} onChange={(e) => setDef({ ...def, email: e.target.checked ? { to: '', subject: '', body: '' } : undefined })} /> Email
+            <input type="checkbox" checked={!!def.email} onChange={(e) => setDef({ ...def, email: e.target.checked ? { to: '', subject: '', body: '', attachments: [] } : undefined })} /> Email
           </label>
           {def.email && (
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -193,6 +195,26 @@ function RuleDialog({ wf, rule, onClose, onSaved }: { wf: WorkflowView; rule: Ru
               <FormField label="Cc">
                 <Input value={def.email.cc ?? ''} onChange={(e) => setDef({ ...def, email: { ...def.email!, cc: e.target.value || undefined } })} />
               </FormField>
+              <FormField label="Sender name" hint="Shown as the sender; the address stays the email connection's">
+                <Input value={def.email.fromName ?? ''} placeholder="e.g. Acme Sales Team" onChange={(e) => setDef({ ...def, email: { ...def.email!, fromName: e.target.value || undefined } })} />
+              </FormField>
+              <div>
+                <span className="label">Attach files from</span>
+                {fileFields.length === 0 ? (
+                  <p className="text-xs text-muted">This flow has no file fields (uploads or document steps).</p>
+                ) : (
+                  <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                    {fileFields.map((f) => (
+                      <Checkbox
+                        key={f.key}
+                        label={f.label}
+                        checked={def.email!.attachments.includes(f.key)}
+                        onChange={(on) => setDef({ ...def, email: { ...def.email!, attachments: on ? [...def.email!.attachments, f.key] : def.email!.attachments.filter((k) => k !== f.key) } })}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
               <FormField label="Subject" className="md:col-span-2">
                 <Input value={def.email.subject} onChange={(e) => setDef({ ...def, email: { ...def.email!, subject: e.target.value } })} />
               </FormField>

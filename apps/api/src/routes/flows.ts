@@ -5,7 +5,6 @@
  * Legacy mapping: one FMS spreadsheet per process → one flow; "make a copy of the
  * sheet" → duplicate / use template; the Settings tab → the node editor.
  */
-import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import {
@@ -33,7 +32,7 @@ import { AppError, parse } from '../lib/errors.js';
 import { renderDocument } from '../lib/docgen.js';
 import { assertWorkflowSlot } from '../lib/license.js';
 import { groupSql } from '../lib/record-sql.js';
-import { getWorkflow, invalidateWorkflow, workflowFor } from '../lib/workflows.js';
+import { ensurePublicFormId, getWorkflow, invalidateWorkflow, workflowFor } from '../lib/workflows.js';
 import type { AuthUser } from '../plugins/auth.js';
 
 const flowParams = z.object({ wf: z.string().min(1).max(64) });
@@ -108,7 +107,7 @@ async function createDraft(p: AuthUser, input: NewFlow, ip: string) {
         settings: json(settings),
         canvas: input.canvas ? json(input.canvas) : Prisma.JsonNull,
         calendarId: calendar.id,
-        versions: { create: { version: 1, definition: json(definition), settings: json(settings), createdById: p.userId } },
+        versions: { create: { version: 1, definition: json(definition), settings: json(settings), canvas: input.canvas ? json(input.canvas) : Prisma.JsonNull, note: 'created', createdById: p.userId } },
       },
     });
     for (const r of input.rules ?? []) await tx.notificationRule.create({ data: { workflowId: wf.id, definition: json(r.definition), isActive: r.isActive, canvasNodeId: r.canvasNodeId } });
@@ -381,6 +380,8 @@ export default async function flowRoutes(app: FastifyInstance) {
     settings: workflowSettingsSchema,
     calendarId: z.string().min(1).max(40).optional(),
     publish: z.boolean().default(false),
+    /** Set when this save brings back an older version (Version history › Restore). */
+    restoredFrom: z.number().int().positive().optional(),
   });
 
   /** Save the canvas: compile → definition + settings + message rules, all in one transaction. */
@@ -396,14 +397,14 @@ export default async function flowRoutes(app: FastifyInstance) {
     if (!compiled.definition || !compiled.settings) {
       throw new AppError(422, 'FLOW_INVALID', compiled.errors[0]?.message ?? 'The flow has problems', { errors: compiled.errors, warnings: compiled.warnings });
     }
-    const definition = compiled.definition;
+    const definition = await ensurePublicFormId(wf.id, compiled.definition);
     const settings = compiled.settings;
-    // A public intake form needs its link id (the editor sets one; this covers API clients).
-    const intake = definition.stages[0];
-    if (intake?.publicForm && !intake.publicFormId) intake.publicFormId = randomBytes(18).toString('base64url');
     const existing = await prisma.notificationRule.findMany({ where: { workflowId: wf.id } });
     const nodeRuleId = new Map(body.canvas.nodes.filter((n) => n.type === 'message' && typeof n.data.ruleId === 'string').map((n) => [n.id, n.data.ruleId as string]));
 
+    if (body.restoredFrom && !(await prisma.workflowVersion.count({ where: { workflowId: wf.id, version: body.restoredFrom } }))) throw AppError.badRequest(`Version ${body.restoredFrom} does not exist`);
+    const canvas = json(stripRuleIds(body.canvas));
+    const note = body.restoredFrom ? `restored:${body.restoredFrom}` : body.publish && wf.isDraft ? 'published' : 'saved';
     const version = await prisma.$transaction(async (tx) => {
       const row = await tx.workflow.update({
         where: { id: wf.id },
@@ -412,13 +413,13 @@ export default async function flowRoutes(app: FastifyInstance) {
           description: definition.description ?? null,
           definition: json(definition),
           settings: json(settings),
-          canvas: json(stripRuleIds(body.canvas)),
+          canvas,
           calendarId: body.calendarId ?? undefined,
           ...(body.publish ? { isDraft: false, isActive: true } : {}),
           version: { increment: 1 },
         },
       });
-      await tx.workflowVersion.create({ data: { workflowId: wf.id, version: row.version, definition: json(definition), settings: json(settings), createdById: p.userId } });
+      await tx.workflowVersion.create({ data: { workflowId: wf.id, version: row.version, definition: json(definition), settings: json(settings), canvas, note, createdById: p.userId } });
 
       const kept = new Set<string>();
       for (const r of compiled.rules) {
@@ -433,11 +434,67 @@ export default async function flowRoutes(app: FastifyInstance) {
       }
       // Canvas-owned rules whose Message node was removed (or is no longer configured).
       await tx.notificationRule.deleteMany({ where: { workflowId: wf.id, canvasNodeId: { not: null }, id: { notIn: [...kept] } } });
-      await audit(tx, { orgId: wf.orgId, actor: p, action: body.publish && wf.isDraft ? 'workflow.published' : 'workflow.saved', entityType: 'Workflow', entityId: wf.id, diff: { version: row.version, rules: compiled.rules.length }, ip: req.ip });
+      await audit(tx, {
+        orgId: wf.orgId,
+        actor: p,
+        action: body.restoredFrom ? 'workflow.restored' : body.publish && wf.isDraft ? 'workflow.published' : 'workflow.saved',
+        entityType: 'Workflow',
+        entityId: wf.id,
+        diff: { version: row.version, rules: compiled.rules.length, ...(body.restoredFrom ? { restoredFrom: body.restoredFrom } : {}) },
+        ip: req.ip,
+      });
       return row.version;
     });
     invalidateWorkflow();
-    return { version, warnings: compiled.warnings, isDraft: body.publish ? false : wf.isDraft };
+    // The public link id the server kept (it replaces one that clashes with another flow).
+    return { version, warnings: compiled.warnings, isDraft: body.publish ? false : wf.isDraft, publicFormId: definition.stages[0]?.publicForm ? (definition.stages[0].publicFormId ?? null) : null };
+  });
+
+  // ------------------------------------------------------------ version history
+  async function authors(ids: (string | null)[]) {
+    const wanted = [...new Set(ids.filter((x): x is string => !!x))];
+    const users = wanted.length ? await prisma.user.findMany({ where: { id: { in: wanted } }, select: { id: true, name: true, email: true } }) : [];
+    return new Map(users.map((u) => [u.id, { name: u.name, email: u.email }]));
+  }
+
+  /** Every saved version, newest first (who, when, how). */
+  app.get('/flows/:wf/versions', admin, async (req) => {
+    const { wf: key } = parse(flowParams, req.params);
+    const wf = await getWorkflow(req.principal.orgId, key, { includeTrashed: true });
+    const rows = await prisma.workflowVersion.findMany({
+      where: { workflowId: wf.id },
+      orderBy: { version: 'desc' },
+      take: 200,
+      select: { version: true, createdAt: true, createdById: true, note: true },
+    });
+    const who = await authors(rows.map((r) => r.createdById));
+    return {
+      current: wf.version,
+      items: rows.map((r) => ({ version: r.version, createdAt: r.createdAt.toISOString(), note: r.note, author: r.createdById ? (who.get(r.createdById) ?? null) : null })),
+    };
+  });
+
+  /** One version's content, for comparing and restoring in the editor. */
+  app.get('/flows/:wf/versions/:version', admin, async (req) => {
+    const { wf: key, version } = parse(flowParams.extend({ version: z.coerce.number().int().positive() }), req.params);
+    const wf = await getWorkflow(req.principal.orgId, key, { includeTrashed: true });
+    const row = await prisma.workflowVersion.findUnique({ where: { workflowId_version: { workflowId: wf.id, version } } });
+    if (!row) throw AppError.notFound('Version');
+    // Old versions may predate today's rules; they are still shown, and the editor re-checks them on save.
+    const def = workflowDefSchema.safeParse(row.definition);
+    const settings = workflowSettingsSchema.safeParse(row.settings);
+    const canvas = canvasSchema.safeParse(row.canvas);
+    const who = await authors([row.createdById]);
+    return {
+      version: row.version,
+      createdAt: row.createdAt.toISOString(),
+      note: row.note,
+      author: row.createdById ? (who.get(row.createdById) ?? null) : null,
+      definition: def.success ? def.data : row.definition,
+      settings: settings.success ? settings.data : wf.settings,
+      canvas: row.canvas && canvas.success ? canvas.data : null,
+      valid: def.success,
+    };
   });
 
   /** Document step "Download sample": the document as it would be generated, filled with sample values. */

@@ -10,13 +10,15 @@ import {
   computeTimeline,
   defaultFieldValues,
   editableFieldKeys,
+  evaluateGroup,
   hasCapability,
   isAdmin,
   isEmptyValue,
-  isResponsibleFor,
+  canActOnStage,
   projectData,
   recordTitle,
   stageAccess,
+  staleDependents,
   uniqueValues,
   validateRecordInput,
   visibleFieldKeys,
@@ -33,6 +35,9 @@ import { storeBuffer } from '../lib/filestore.js';
 import { publishRecordChanged } from '../lib/queue.js';
 
 const MAX_ITEMS = 200;
+
+/** Ends a dry-run transaction without writing. */
+class DryRunDone extends Error {}
 
 export interface StageDto {
   stageKey: string;
@@ -55,6 +60,8 @@ export interface RecordDto {
   updatedAt: string;
   version: number;
   stages: StageDto[];
+  /** Records table colour from the flow's row colour rules (null = none matched). */
+  rowColor: { color: string; label: string | null } | null;
 }
 
 type RowLike = Pick<RecordRow, 'id' | 'number' | 'submissionId' | 'data' | 'currentStageKey' | 'completedAt' | 'archivedAt' | 'createdAt' | 'updatedAt' | 'version'>;
@@ -63,12 +70,16 @@ export function toDto(wf: LoadedWorkflow, p: AuthUser, row: RowLike, stages: rea
   const visible = visibleFieldKeys(wf.def.fields, p, wf.def.stages);
   const data = projectData(row.data as RecordData, visible);
   const byKey = new Map(stages.map((s) => [s.stageKey, s]));
+  // Row colour (Flow settings › Records table): the first matching rule. Rules that test a field this
+  // user can not see are skipped, so a colour never gives a hidden value away.
+  const colour = wf.settings.table.rowColors.find((r) => r.when.conditions.length > 0 && r.when.conditions.every((c) => visible.has(c.field)) && evaluateGroup(r.when, data));
   return {
     id: row.id,
     number: row.number,
     title: recordTitle(wf.def.fields.filter((f) => visible.has(f.key)), data, row.number),
     submissionId: row.submissionId,
     data,
+    rowColor: colour ? { color: colour.color, label: colour.label ?? null } : null,
     currentStageKey: row.currentStageKey,
     completedAt: row.completedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -131,7 +142,49 @@ export interface CreateInput {
   items?: Record<string, unknown>[];
 }
 
-export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: CreateInput, ip?: string): Promise<RecordDto[]> {
+/**
+ * Add line items to an existing multi-item submission (legacy EditResponse): new records in the same
+ * submission, with the submission's header values copied from one of its records.
+ */
+export async function addSubmissionItems(p: AuthUser, wf: LoadedWorkflow, recordId: string, items: Record<string, unknown>[], ip?: string): Promise<RecordDto[]> {
+  const row = await prisma.record.findFirst({ where: { id: recordId, workflowId: wf.id } });
+  if (!row || !canSeeRecord(p, row.data as RecordData)) throw AppError.notFound('Record');
+  if (!row.submissionId) throw AppError.badRequest('This record is not part of a multi-item submission');
+  const { header, items: itemFields } = intakeFields(wf);
+  if (!itemFields.length) throw AppError.badRequest('This workflow has no line items');
+  const count = await prisma.record.count({ where: { submissionId: row.submissionId, archivedAt: null } });
+  if (count + items.length > MAX_ITEMS) throw AppError.badRequest(`At most ${MAX_ITEMS} items per submission`);
+  const data = row.data as RecordData;
+  const headerData = Object.fromEntries(header.filter((f) => f.key in data).map((f) => [f.key, data[f.key]])) as RecordData;
+  return createSubmission(p, wf, { data: {}, items }, ip, { submissionId: row.submissionId, header: headerData });
+}
+
+/**
+ * CSV import: each row becomes a record (a one-item submission when the flow has line items),
+ * with the same validation, defaults, unique checks and timeline as the form. `dryRun` checks
+ * every row and saves nothing. Rows are independent: one bad row does not stop the others.
+ */
+export async function importRecords(p: AuthUser, wf: LoadedWorkflow, rows: Record<string, unknown>[], opts: { dryRun: boolean }, ip?: string) {
+  const { items: itemFields } = intakeFields(wf);
+  const itemKeys = new Set(itemFields.map((f) => f.key));
+  const results: { row: number; ok: boolean; number?: number; errors?: Record<string, string>; message?: string }[] = [];
+  for (const [i, raw] of rows.entries()) {
+    const header = Object.fromEntries(Object.entries(raw).filter(([k]) => !itemKeys.has(k)));
+    const item = Object.fromEntries(Object.entries(raw).filter(([k]) => itemKeys.has(k)));
+    try {
+      const created = await createSubmission(p, wf, { data: header, ...(itemFields.length ? { items: [item] } : {}) }, ip, undefined, { dryRun: opts.dryRun, quiet: true });
+      results.push({ row: i + 1, ok: true, number: created[0]?.number });
+    } catch (e) {
+      const errors = e instanceof AppError && e.details ? Object.fromEntries(Object.entries(e.details as Record<string, string>).map(([k, v]) => [k.replace(/^items\.0\./, ''), v])) : undefined;
+      results.push({ row: i + 1, ok: false, errors, message: (e as Error).message });
+    }
+  }
+  const ok = results.filter((r) => r.ok).length;
+  if (!opts.dryRun && ok) await audit(prisma, { orgId: wf.orgId, actor: p, action: 'records.imported', entityType: 'Workflow', entityId: wf.id, diff: { rows: rows.length, created: ok }, ip });
+  return { total: rows.length, ok, failed: rows.length - ok, results: results.filter((r) => !r.ok).slice(0, 500) };
+}
+
+export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: CreateInput, ip?: string, into?: { submissionId: string; header: RecordData }, mode: { dryRun?: boolean; quiet?: boolean } = {}): Promise<RecordDto[]> {
   if (!wf.isActive) throw AppError.conflict('This workflow is not accepting new records');
   if (!hasCapability(p, 'CREATE')) throw AppError.forbidden('You cannot create records in this workflow');
 
@@ -152,8 +205,9 @@ export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: C
 
   const headerIn = input.data ?? {};
   const headerDefaults = defaultsFor(header, headerIn);
-  const h = validateRecordInput(header, headerIn, { mode: 'create', editable, requiredScope: requiredFor(header, headerDefaults), existing: headerDefaults, options: wf.options, timezone: tz, ruleContext });
-  h.data = { ...headerDefaults, ...h.data };
+  // Adding to an existing submission: its header is already validated and saved.
+  const h = into ? { data: { ...into.header }, errors: {} } : validateRecordInput(header, headerIn, { mode: 'create', editable, requiredScope: requiredFor(header, headerDefaults), existing: headerDefaults, options: wf.options, timezone: tz, ruleContext });
+  if (!into) h.data = { ...headerDefaults, ...h.data };
   Object.assign(errors, h.errors);
 
   const rawItems = input.items ?? [];
@@ -174,8 +228,18 @@ export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: C
   }
   if (Object.keys(errors).length) throw AppError.validation(errors);
 
-  const finalRows = rows.map((r) => applySystemFields(wf.def.fields, r, { isCreate: true, userEmail: p.email }));
+  const finalRows = rows.map((r) => applySystemFields(wf.def.fields, r, { isCreate: true, userEmail: p.email, timezone: tz }));
   await assertFilesOwned(p, wf.orgId, wf.def.fields, finalRows);
+  if (mode.dryRun) {
+    // Check unique values too, then roll back: nothing is written in a dry run.
+    await prisma.$transaction(async (tx) => {
+      await assertUnique(tx, wf, finalRows);
+      throw new DryRunDone();
+    }).catch((e) => {
+      if (!(e instanceof DryRunDone)) throw e;
+    });
+    return finalRows.map((_, i) => ({ number: 0, id: `dry-${i}` }) as RecordDto);
+  }
 
   const created = await prisma.$transaction(async (tx) => {
     await lockForUnique(tx, wf);
@@ -184,8 +248,8 @@ export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: C
     const seq = await tx.$queryRaw<{ recordSeq: number }[]>`
       UPDATE "Workflow" SET "recordSeq" = "recordSeq" + ${finalRows.length} WHERE "id" = ${wf.id} RETURNING "recordSeq"`;
     const recordSeq = seq[0]!.recordSeq;
-    let submissionId: string | null = null;
-    if (itemFields.length) {
+    let submissionId: string | null = into?.submissionId ?? null;
+    if (itemFields.length && !into) {
       const sub = await tx.$queryRaw<{ submissionSeq: number }[]>`
         UPDATE "Workflow" SET "submissionSeq" = "submissionSeq" + 1 WHERE "id" = ${wf.id} RETURNING "submissionSeq"`;
       submissionId = (await tx.submission.create({ data: { workflowId: wf.id, number: sub[0]!.submissionSeq, createdById: p.userId } })).id;
@@ -217,7 +281,10 @@ export async function createSubmission(p: AuthUser, wf: LoadedWorkflow, input: C
 
   await publishRecordChanged(created.map((c) => c.row.id));
   const ids = created.map((c) => c.row.id);
-  if (await afterWrite(p, wf, ids)) return Promise.all(ids.map((id) => getRecord(p, wf, id)));
+  const regenerated = await afterWrite(p, wf, ids);
+  // Imports only need the numbers.
+  if (mode.quiet) return created.map((c) => ({ id: c.row.id, number: c.row.number }) as RecordDto);
+  if (regenerated) return Promise.all(ids.map((id) => getRecord(p, wf, id)));
   return created.map((c) => toDto(wf, p, c.row, c.stages));
 }
 
@@ -315,7 +382,10 @@ async function applyChange(p: AuthUser, wf: LoadedWorkflow, id: string, input: U
     });
     if (Object.keys(v.errors).length) throw AppError.validation(v.errors);
 
-    const merged = applySystemFields(wf.def.fields, { ...existing, ...v.data }, { isCreate: false });
+    // A changed parent clears dependent dropdown values it no longer offers (down the chain).
+    const changedKeys = Object.keys(v.data).filter((k) => v.data[k] !== existing[k]);
+    const next = { ...existing, ...v.data };
+    const merged = applySystemFields(wf.def.fields, { ...next, ...staleDependents(wf.def.fields, next, changedKeys) }, { isCreate: false, timezone: wf.calendar.config.timezone });
     if (!opts.systemPatch) await assertFilesOwned(p, wf.orgId, wf.def.fields, [merged], existing);
     const changedUnique = wf.def.fields.filter((f) => f.unique && f.key in v.data && merged[f.key] !== existing[f.key]);
     if (changedUnique.length) {
@@ -331,10 +401,10 @@ async function applyChange(p: AuthUser, wf: LoadedWorkflow, id: string, input: U
       if (stage.completion.kind === 'on_create') throw AppError.badRequest('This stage completes automatically');
       if (stage.singleUpdate === false && !opts.bulk && !isAdmin(p)) throw AppError.badRequest(`"${stage.name}" is updated in bulk from the records table`);
       const stageFields = wf.def.fields.filter((f) => f.stageKey === stage.key);
-      const canAct =
-        isAdmin(p) ||
-        (stageAccess(stage, p).edit &&
-          (stage.responsibleGroups.length ? isResponsibleFor(stage.responsibleGroups, p) : stageFields.some((f) => editableFieldKeys([f], p, wf.def.stages).size > 0)));
+      // Restricted stage → its assigned Editors; owned stage → its groups; unowned → anyone who may fill
+      // in one of its fields (a stage without fields would otherwise be completable by admins only).
+      const unowned = !stage.stageAccessRestricted && !stage.responsibleGroups.length;
+      const canAct = canActOnStage(stage, p) && (!unowned || isAdmin(p) || !stageFields.length || stageFields.some((f) => editableFieldKeys([f], p, wf.def.stages).size > 0));
       if (!canAct) throw AppError.forbidden(`You are not responsible for "${stage.name}"`);
       // Hidden fields are never shown in a form, so they can not hold a stage up.
       const missing = stageFields.filter((f) => f.required && !f.hidden && f.type !== 'computed' && (isEmptyValue(merged[f.key]) || merged[f.key] === false));
@@ -470,7 +540,7 @@ export async function regenerateDocument(p: AuthUser, wf: LoadedWorkflow, id: st
   if (row.archivedAt) throw AppError.conflict('Archived records are read-only');
   if (!wf.isActive) throw AppError.conflict('This flow is inactive, so its records are read-only.');
   if (row.stages.find((s) => s.stageKey === stageKey)?.status !== 'active') throw AppError.conflict(`"${stage.name}" is not the active step`);
-  const allowed = isAdmin(p) || (stageAccess(stage, p).edit && (!stage.responsibleGroups.length || isResponsibleFor(stage.responsibleGroups, p)));
+  const allowed = canActOnStage(stage, p) && stageAccess(stage, p).edit;
   if (!allowed) throw AppError.forbidden(`You are not responsible for "${stage.name}"`);
   await generateDocuments(p, wf, id, stageKey);
   return getRecord(p, wf, id);
@@ -481,7 +551,7 @@ export async function setPlannedTime(p: AuthUser, wf: LoadedWorkflow, id: string
   const stage = wf.def.stages.find((s) => s.key === stageKey);
   if (!stage) throw AppError.notFound('Stage');
   if (stage.planned.mode !== 'manual') throw AppError.badRequest('This stage is planned automatically');
-  if (!isAdmin(p) && (!isResponsibleFor(stage.responsibleGroups, p) || !stageAccess(stage, p).edit)) throw AppError.forbidden();
+  if (!canActOnStage(stage, p) || !stageAccess(stage, p).edit) throw AppError.forbidden(`You are not responsible for "${stage.name}"`);
   await prisma.$transaction(async (tx) => {
     const row = await loadForWrite(tx, wf, p, id);
     const st = row.stages.find((s) => s.stageKey === stageKey);

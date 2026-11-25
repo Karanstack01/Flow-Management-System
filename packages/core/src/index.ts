@@ -13,3 +13,5 @@ export * from './jobs.js';
 export * from './canvas.js';
 export * from './templates.js';
 export * from './connections.js';
+export * from './versions.js';
+export * from './dependent.js';

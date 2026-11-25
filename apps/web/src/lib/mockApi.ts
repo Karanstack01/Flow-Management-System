@@ -1,4 +1,5 @@
-import type { Me, WorkflowSummary, WorkflowView, RecordList, RecordDto, StageSummaryRow, PendingTask, MyTask, PlatformOrg, PlatformUser, PlatformOverview } from './types';
+import { staleDependents } from '@fms/core';
+import type { Me, WorkflowSummary, WorkflowView, RecordList, RecordDto, StageSummaryRow, PendingTask, MyTask, PlatformOrg, PlatformUser, PlatformOverview, HistoryEntry, DeliveryLog } from './types';
 
 import { definitionOf, handleFlowsRequest, saveDefinition, viewOf, workflowSummaries } from './mockFlows';
 
@@ -90,24 +91,39 @@ const mockWorkflowView: WorkflowView = {
   canArchive: true,
   canExport: true,
   stages: [
-    { key: 'intake', name: 'Order Received', color: '#2563eb', responsibleGroups: ['SALES'], plannedMode: 'none', completion: 'on_create', isMine: true },
-    { key: 'approval', name: 'Approval', color: '#7c3aed', responsibleGroups: ['MANAGER'], plannedMode: 'tat', completion: 'conditions', isMine: true },
-    { key: 'production', name: 'Production', color: '#ea580c', responsibleGroups: ['PRODUCTION'], plannedMode: 'tat', completion: 'manual', isMine: true },
-    { key: 'dispatch', name: 'Dispatch', color: '#0891b2', responsibleGroups: ['STORE'], plannedMode: 'tat', completion: 'conditions', isMine: true },
-    { key: 'payment', name: 'Payment Follow-up', color: '#16a34a', responsibleGroups: ['ACCOUNTS'], plannedMode: 'tat', completion: 'conditions', isMine: true },
+    // Offline demo of the access states the record page shows (a real admin can act on every stage).
+    { key: 'intake', name: 'Order Received', color: '#2563eb', responsibleGroups: ['SALES'], plannedMode: 'none', completion: 'on_create', isMine: true, canAct: true, canView: true, canEdit: true, description: 'Sales logs the order with the customer details.' },
+    { key: 'approval', name: 'Approval', color: '#7c3aed', responsibleGroups: ['MANAGER'], plannedMode: 'tat', completion: 'manual', isMine: true, canAct: true, canView: true, canEdit: true, description: 'The manager approves or rejects the order within 4 working hours.' },
+    { key: 'production', name: 'Production', color: '#ea580c', responsibleGroups: ['PRODUCTION'], plannedMode: 'tat', completion: 'manual', isMine: true, canAct: true, canView: true, canEdit: true, assignees: [{ email: 'priya@example.com', role: 'Editor' }, { email: 'admin@example.com', role: 'Editor' }, { email: 'ravi@example.com', role: 'Viewer' }] },
+    { key: 'dispatch', name: 'Dispatch', color: '#0891b2', responsibleGroups: ['STORE'], plannedMode: 'tat', completion: 'manual', isMine: false, canAct: false, canView: true, canEdit: false, conditional: false },
+    { key: 'payment', name: 'Payment Follow-up', color: '#16a34a', responsibleGroups: ['ACCOUNTS'], plannedMode: 'tat', completion: 'manual', isMine: false, canAct: false, canView: false, canEdit: false, conditional: true },
   ],
   fields: [
     { key: 'customer', label: 'Customer Name', type: 'text', stageKey: 'intake', required: true, unique: false, searchKey: true, frozen: true, lineItem: false, canEdit: true },
     { key: 'customer_email', label: 'Customer Email', type: 'email', stageKey: 'intake', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
     { key: 'customer_phone', label: 'Customer Phone', type: 'phone', stageKey: 'intake', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
     { key: 'city', label: 'City', type: 'select', stageKey: 'intake', required: true, unique: false, searchKey: false, frozen: false, lineItem: false, options: ['Mumbai', 'Delhi', 'Bengaluru', 'Pune', 'Hyderabad'], canEdit: true },
+    {
+      key: 'area',
+      label: 'Area',
+      type: 'dependent-select',
+      stageKey: 'intake',
+      required: false,
+      unique: false,
+      searchKey: false,
+      frozen: false,
+      lineItem: false,
+      dependsOn: 'city',
+      dependsOnLabel: 'City',
+      optionMap: { Mumbai: ['Andheri', 'Bandra', 'Powai'], Delhi: ['Saket', 'Dwarka'], Bengaluru: ['Whitefield', 'Koramangala'], Pune: ['Hinjewadi', 'Kothrud'] },
+      canEdit: true,
+    },
     { key: 'priority', label: 'Priority', type: 'select', stageKey: 'intake', required: true, unique: false, searchKey: false, frozen: false, lineItem: false, options: ['Urgent', 'Normal'], canEdit: true },
     { key: 'due_date', label: 'Payment Due Date', type: 'date', stageKey: 'intake', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
     { key: 'approval_status', label: 'Approval Status', type: 'select', stageKey: 'approval', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, options: ['Approved', 'Rejected', 'Pending Review'], canEdit: true },
     { key: 'approval_remarks', label: 'Approval Remarks', type: 'textarea', stageKey: 'approval', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
     { key: 'batch_no', label: 'Batch No.', type: 'text', stageKey: 'production', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
-    { key: 'dispatch_no', label: 'Dispatch / LR No.', type: 'text', stageKey: 'dispatch', required: false, unique: true, searchKey: false, frozen: false, lineItem: false, canEdit: true },
-    { key: 'payment_received', label: 'Payment Received', type: 'checkbox', stageKey: 'payment', required: false, unique: false, searchKey: false, frozen: false, lineItem: false, canEdit: true },
+    { key: 'dispatch_no', label: 'Dispatch / LR No.', type: 'text', stageKey: 'dispatch', required: false, unique: true, searchKey: false, frozen: false, lineItem: false, canEdit: false },
   ],
 };
 
@@ -362,6 +378,19 @@ const mockAdminUsers: AdminUserRow[] = [
     locked: false,
     isSuperAdmin: false,
   },
+];
+
+interface MockTile {
+  id: string;
+  name: string;
+  url: string;
+  description: string | null;
+  icon: string;
+  groups: string[];
+}
+const mockTiles: MockTile[] = [
+  { id: 'tile-1', name: 'Sales dashboard', url: 'https://example.com/sales', description: 'Monthly targets and orders', icon: 'chart', groups: [] },
+  { id: 'tile-2', name: 'Price list', url: 'https://example.com/price-list', description: null, icon: 'sheet', groups: ['SALES'] },
 ];
 
 const mockAdminGroups = [
@@ -681,12 +710,88 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
   // Record history
   const historyMatch = /^\/workflows\/([^/]+)\/records\/([^/]+)\/history$/.exec(cleanPath);
   if (historyMatch) {
-    return {
-      items: [
-        { id: 'h-1', stageKey: 'intake', action: 'created', actor: { id: 'usr-admin-01', name: 'Administrator' }, timestamp: new Date(Date.now() - 3600000 * 24).toISOString() },
-        { id: 'h-2', stageKey: 'approval', action: 'approved', actor: { id: 'usr-admin-01', name: 'Administrator' }, timestamp: new Date(Date.now() - 3600000 * 20).toISOString() },
-      ],
-    };
+    // Same shape as the API: who did what, with the stage events each change caused (newest first).
+    const rec = sampleRecords.find((r) => r.id === historyMatch[2]) ?? sampleRecords[0]!;
+    const items: HistoryEntry[] = [];
+    const done = rec.stages.filter((s) => s.status === 'done' && s.actualAt);
+    done.forEach((s, i) => {
+      const next = rec.stages.slice(rec.stages.indexOf(s) + 1).find((x) => x.status === 'active' || x.status === 'done');
+      items.push({
+        id: `h-${rec.id}-${i}`,
+        action: i === 0 ? 'record.created' : 'record.stage_completed',
+        actorEmail: i === 0 ? 'ravi@example.com' : 'admin@example.com',
+        createdAt: s.actualAt!,
+        events: [{ type: 'stage_completed', stageKey: s.stageKey }, ...(next ? [{ type: 'stage_activated', stageKey: next.stageKey }] : [])],
+      });
+    });
+    return { items: items.reverse() };
+  }
+
+  // Column filter values (most used first).
+  if (/^\/workflows\/[^/]+\/records\/values$/.test(cleanPath)) {
+    const key = String(opts?.query?.field ?? '');
+    const counts = new Map<string, number>();
+    for (const r of sampleRecords) {
+      const v = r.data[key];
+      for (const x of Array.isArray(v) ? v : v === null || v === undefined || v === '' ? [] : [String(v)]) counts.set(String(x), (counts.get(String(x)) ?? 0) + 1);
+    }
+    return { items: [...counts].sort((a, b) => b[1] - a[1]).map(([value, count]) => ({ value, count })) };
+  }
+
+  // Google Sheets export: not set up in the offline demo.
+  if (/^\/workflows\/[^/]+\/records\/export-sheet$/.test(cleanPath)) {
+    if (method === 'GET') return { configured: false, clientEmail: null };
+    throw new Error('Exporting to Google Sheets needs the API server and a Google Sheets connection.');
+  }
+
+  // CSV import: required fields of the intake form, then new records (dry run saves nothing).
+  if (/^\/workflows\/[^/]+\/records\/import$/.test(cleanPath) && method === 'POST') {
+    const body = (opts?.body ?? {}) as { rows: Record<string, string>[]; dryRun: boolean };
+    const required = mockWorkflowView.fields.filter((f) => f.stageKey === 'intake' && f.required);
+    const results = body.rows.map((r, i) => {
+      const missing = required.filter((f) => !r[f.key]);
+      return missing.length ? { row: i + 1, ok: false, errors: Object.fromEntries(missing.map((f) => [f.key, `${f.label} is required`])) } : { row: i + 1, ok: true };
+    });
+    if (!body.dryRun) {
+      body.rows.forEach((r, i) => {
+        if (!results[i]!.ok) return;
+        const base = sampleRecords[0]!;
+        const number = Math.max(...sampleRecords.map((x) => x.number)) + 1;
+        sampleRecords.unshift({ ...JSON.parse(JSON.stringify(base)), id: `rec-imp-${Date.now()}-${i}`, number, title: r.customer ?? `#${number}`, submissionId: null, data: r, version: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+      });
+    }
+    const ok = results.filter((r) => r.ok).length;
+    return { total: results.length, ok, failed: results.length - ok, results: results.filter((r) => !r.ok) };
+  }
+
+  // Add line items to a record's submission.
+  const itemsMatch = /^\/workflows\/([^/]+)\/records\/([^/]+)\/items$/.exec(cleanPath);
+  if (itemsMatch && method === 'POST') {
+    const rec = sampleRecords.find((r) => r.id === itemsMatch[2]);
+    if (!rec?.submissionId) throw new Error('This record is not part of a multi-item submission');
+    const body = (opts?.body ?? {}) as { items?: Record<string, unknown>[] };
+    const created = (body.items ?? []).map((it, i) => {
+      const number = Math.max(...sampleRecords.map((r) => r.number)) + 1 + i;
+      const copy: RecordDto = { ...JSON.parse(JSON.stringify(rec)), id: `rec-${Date.now()}-${i}`, number, data: { ...rec.data, ...(it as RecordDto['data']) }, version: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      return copy;
+    });
+    sampleRecords.push(...created);
+    return { records: created };
+  }
+
+  // Deliveries for a record (admins): one failed WhatsApp hand-off to show the "how to fix" help.
+  const deliveriesMatch = /^\/workflows\/([^/]+)\/records\/([^/]+)\/notifications$/.exec(cleanPath);
+  if (deliveriesMatch) {
+    const rec = sampleRecords.find((r) => r.id === deliveriesMatch[2]) ?? sampleRecords[0]!;
+    const items: DeliveryLog[] = [];
+    for (const s of rec.stages.filter((x) => x.status !== 'waiting' && x.stageKey !== 'intake')) {
+      const at = rec.stages[rec.stages.indexOf(s) - 1]?.actualAt ?? rec.createdAt;
+      const owner = mockWorkflowView.stages.find((x) => x.key === s.stageKey)?.responsibleGroups[0]?.toLowerCase() ?? 'team';
+      items.push({ id: `d-${s.stageKey}-e`, kind: 'handoff', channel: 'email', recipient: `${owner}@example.com`, status: 'sent', error: null, attempts: 1, stageKey: s.stageKey, ruleName: null, event: 'stage_activated', createdAt: at, updatedAt: at });
+      if (s.stageKey === 'approval')
+        items.push({ id: `d-${s.stageKey}-w`, kind: 'rule', channel: 'whatsapp', recipient: '9876543210', status: 'failed', error: 'WhatsApp: (#132001) Template name does not exist in the translation', attempts: 5, stageKey: s.stageKey, ruleName: 'Client approval on WhatsApp', event: 'stage_activated', createdAt: at, updatedAt: at });
+    }
+    return { items };
   }
 
   // Single record PATCH
@@ -698,7 +803,11 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
     if (rec) {
       rec.version += 1;
       rec.updatedAt = new Date().toISOString();
-      if (body.data) Object.assign(rec.data, body.data);
+      if (body.data) {
+        // Same as the server: a changed parent clears dependent dropdowns that no longer fit.
+        const next = { ...rec.data, ...body.data };
+        Object.assign(rec.data, body.data, staleDependents(mockWorkflowView.fields, next, Object.keys(body.data)));
+      }
       return rec;
     }
     return { ok: true };
@@ -709,9 +818,11 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
   }
 
   if (cleanPath === '/workflows/orders/records') {
+    const sub = opts?.query?.submissionId as string | undefined;
+    const items = sub ? sampleRecords.filter((r) => r.submissionId === sub) : sampleRecords;
     const list: RecordList = {
-      items: sampleRecords,
-      total: sampleRecords.length,
+      items,
+      total: items.length,
       page: 1,
       pageSize: 25,
       aggregates: {},
@@ -723,6 +834,23 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
     const id = cleanPath.split('/').pop();
     const rec = sampleRecords.find((r) => r.id === id || String(r.number) === id) ?? sampleRecords[0];
     return rec;
+  }
+
+  if (/^\/workflows\/[^/]+\/reports\/missing$/.test(cleanPath)) {
+    const only = opts?.query?.stage as string | undefined;
+    const items = sampleRecords.flatMap((r) =>
+      r.stages
+        .filter((s) => s.status === 'active' && (!only || s.stageKey === only))
+        .map((s) => ({
+          recordId: r.id,
+          recordNumber: r.number,
+          title: r.title,
+          stageKey: s.stageKey,
+          missing: mockWorkflowView.fields.filter((f) => f.stageKey === s.stageKey && (r.data[f.key] === undefined || r.data[f.key] === null || r.data[f.key] === '')).map((f) => ({ key: f.key, label: f.label, required: f.required })),
+        }))
+        .filter((x) => x.missing.length),
+    );
+    return { items, total: items.length };
   }
 
   if (cleanPath === '/workflows/orders/reports/summary') {
@@ -760,7 +888,7 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
   }
 
   if (cleanPath.startsWith('/workflows/orders/views')) {
-    return [];
+    return { items: [] };
   }
 
   // Any other flow: view from its definition, no records yet.
@@ -777,6 +905,29 @@ export function handleMockRequest(path: string, opts?: { method?: string; body?:
   }
 
   // --- Admin Groups ---
+  // --- Dashboard quick links ---
+  if (cleanPath === '/dashboard/tiles') return { items: mockTiles, canManage: true };
+  if (cleanPath === '/admin/dashboard-tiles' && method === 'POST') {
+    const b = (opts?.body ?? {}) as Omit<MockTile, 'id'>;
+    if (!/^https?:\/\//i.test(String(b.url))) throw new Error('Links must start with https:// or http://');
+    const t = { ...b, id: `tile-${Date.now()}`, description: b.description || null };
+    mockTiles.push(t);
+    return { id: t.id };
+  }
+  if (cleanPath === '/admin/dashboard-tiles' && method === 'PUT') {
+    const order = ((opts?.body ?? {}) as { order: string[] }).order;
+    mockTiles.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    return { ok: true };
+  }
+  const tileMatch = /^\/admin\/dashboard-tiles\/([^/]+)$/.exec(cleanPath);
+  if (tileMatch) {
+    const i = mockTiles.findIndex((t) => t.id === tileMatch[1]);
+    if (i < 0) throw new Error('Tile not found');
+    if (method === 'DELETE') mockTiles.splice(i, 1);
+    else mockTiles[i] = { ...mockTiles[i]!, ...((opts?.body ?? {}) as Partial<MockTile>) };
+    return { ok: true };
+  }
+
   if (cleanPath === '/admin/groups') {
     if (method === 'GET') return { items: mockAdminGroups };
     if (method === 'POST') {

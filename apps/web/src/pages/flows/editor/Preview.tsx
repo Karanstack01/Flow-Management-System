@@ -25,7 +25,7 @@ import {
   type WebhookNodeData,
   type WorkflowDef,
 } from '@fms/core';
-import { FieldInput } from '../../../components/FieldInput';
+import { changeWithDependents, FieldInput } from '../../../components/FieldInput';
 import { StageIntro } from '../../../components/StageIntro';
 import { Badge, Button, FormField, Modal } from '../../../components/ui';
 import { downloadPost } from '../../../lib/api';
@@ -33,7 +33,7 @@ import type { FieldView, RecordData } from '../../../lib/types';
 import { MessagePreview } from './MessageComposer';
 import { conditionText, timerText, type FlowNode } from './nodes';
 
-export const toFieldView = (f: FieldDef): FieldView => ({
+export const toFieldView = (f: FieldDef, all?: readonly FieldDef[]): FieldView => ({
   key: f.key,
   label: f.label,
   type: f.type,
@@ -45,6 +45,7 @@ export const toFieldView = (f: FieldDef): FieldView => ({
   lineItem: f.lineItem,
   options: f.options,
   dependsOn: f.dependsOn,
+  dependsOnLabel: f.dependsOn ? all?.find((x) => x.key === f.dependsOn)?.label : undefined,
   optionMap: f.optionMap,
   width: f.width,
   helpText: f.helpText,
@@ -113,7 +114,12 @@ export function DocumentPreview({ cfg, def, stageName, flowKey }: { cfg: Documen
 // ------------------------------------------------------------------ stage form
 function StageFormPreview({ stage, def, isIntake }: { stage: StageDef; def: WorkflowDef; isIntake: boolean }) {
   const fields = def.fields.filter((f) => f.stageKey === stage.key && !f.hidden && f.key !== stage.document?.fieldKey);
-  const [data, setData] = useState<RecordData>({});
+  const views = useMemo(() => def.fields.map((f) => toFieldView(f, def.fields)), [def.fields]);
+  // Earlier stages hold sample values, so a dependent dropdown here has a parent value to follow.
+  const [data, setData] = useState<RecordData>(() => {
+    const sample = sampleRecord(def.fields) as RecordData;
+    return Object.fromEntries(Object.entries(sample).filter(([k]) => !fields.some((f) => f.key === k)));
+  });
   const facts = [
     isIntake ? 'Intake form — done when submitted' : stage.document ? (stage.document.requireReview ? 'Done after someone reviews the document' : 'Done as soon as the document is generated') : stage.completion.kind === 'conditions' ? 'Done automatically when its conditions are met' : 'The owner marks it done',
     stage.responsibleGroups.length ? `Owners: ${stage.responsibleGroups.join(', ')}` : 'No owners',
@@ -140,10 +146,10 @@ function StageFormPreview({ stage, def, isIntake }: { stage: StageDef; def: Work
       ) : (
         <div className="grid grid-cols-1 gap-4 rounded-2xl border border-line p-4 md:grid-cols-2">
           {fields.map((f) => {
-            const v = toFieldView(f);
+            const v = toFieldView(f, def.fields);
             return (
               <FormField key={f.key} label={f.label} required={f.required} hint={f.helpText} className={f.type === 'textarea' ? 'md:col-span-2' : undefined}>
-                <FieldInput field={v} value={data[f.key]} onChange={(x: FieldValue) => setData((d) => ({ ...d, [f.key]: x }))} zone="UTC" data={data} disabled={f.type === 'file' || f.type === 'computed' || f.type === 'user-email'} />
+                <FieldInput field={v} value={data[f.key]} onChange={(x: FieldValue) => setData((d) => changeWithDependents(views, d, f.key, x))} zone="UTC" data={data} disabled={f.type === 'file' || f.type === 'computed' || f.type === 'user-email'} />
               </FormField>
             );
           })}

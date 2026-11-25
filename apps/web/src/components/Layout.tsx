@@ -29,39 +29,9 @@ import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { useAuth } from '../lib/auth';
 import { useWorkflows } from '../lib/queries';
+import { useTheme, type ThemeMode } from '../lib/theme';
 import { StackDroveLogo } from './StackDroveLogo';
 import { Button } from './ui';
-
-// ------------------------------------------------------------------ theme
-type ThemeMode = 'light' | 'dark' | 'system';
-
-export function useTheme() {
-  const [mode, setMode] = useState<ThemeMode>(() => {
-    try {
-      return (localStorage.getItem('fms-theme') as ThemeMode | null) ?? 'system';
-    } catch {
-      return 'system';
-    }
-  });
-  const [systemDark, setSystemDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const on = (e: MediaQueryListEvent) => setSystemDark(e.matches);
-    mq.addEventListener('change', on);
-    return () => mq.removeEventListener('change', on);
-  }, []);
-  useEffect(() => {
-    if (mode === 'system') delete document.documentElement.dataset.theme;
-    else document.documentElement.dataset.theme = mode;
-    try {
-      localStorage.setItem('fms-theme', mode);
-    } catch {
-      /* storage unavailable */
-    }
-  }, [mode]);
-  const isDark = mode === 'system' ? systemDark : mode === 'dark';
-  return { mode, setMode, isDark, toggle: () => setMode(isDark ? 'light' : 'dark') };
-}
 
 // ------------------------------------------------------------------ sidebar state
 const SidebarContext = createContext<{ collapsed: boolean }>({ collapsed: false });

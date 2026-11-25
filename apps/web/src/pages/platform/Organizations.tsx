@@ -6,7 +6,7 @@ import { toast } from 'sonner';
 import { Badge, Button, Card, ErrorNote, FormField, Input, Modal, PageHeader, Spinner, Textarea } from '../../components/ui';
 import { api } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
-import { fmtNumber } from '../../lib/format';
+import { fmtDate, fmtNumber } from '../../lib/format';
 import type { OrgStatus, PlatformOrg } from '../../lib/types';
 
 const STATUS: Record<OrgStatus, { label: string; tone: 'success' | 'danger' | 'warning' }> = {
@@ -97,7 +97,7 @@ export default function OrganizationsPage() {
                     <td className="text-right tabular-nums">{usage(o.activeUsers, o.maxUsers)}</td>
                     <td className="text-right tabular-nums">{usage(o.workflows, o.maxWorkflows)}</td>
                     <td className="text-right tabular-nums">{fmtNumber(o.records)}</td>
-                    <td className="whitespace-nowrap text-muted">{o.licenseExpiresAt ? new Date(o.licenseExpiresAt).toLocaleDateString() : 'No expiry'}</td>
+                    <td className="whitespace-nowrap text-muted">{o.licenseExpiresAt ? fmtDate(o.licenseExpiresAt) : 'No expiry'}</td>
                     <td>
                       <span className="flex justify-end gap-1">
                         {o.id !== user?.orgId && (

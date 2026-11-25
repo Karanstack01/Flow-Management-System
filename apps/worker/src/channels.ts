@@ -26,7 +26,17 @@ export function createChannels(cfg: WorkerConfig): Channels {
   return {
     async email(msg) {
       if (!msg.to.length) return;
-      await transporter.sendMail({ from: cfg.SMTP_FROM, to: msg.to, cc: msg.cc?.length ? msg.cc : undefined, subject: msg.subject, html: msg.html, text: msg.text });
+      // A per-message sender name keeps the configured address.
+      const address = /<([^>]+)>/.exec(cfg.SMTP_FROM)?.[1] ?? cfg.SMTP_FROM;
+      await transporter.sendMail({
+        from: msg.fromName ? { name: msg.fromName, address } : cfg.SMTP_FROM,
+        to: msg.to,
+        cc: msg.cc?.length ? msg.cc : undefined,
+        subject: msg.subject,
+        html: msg.html,
+        text: msg.text,
+        attachments: msg.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })),
+      });
     },
     async whatsapp(to, msg) {
       if (!cfg.WHATSAPP_API_URL || !msg.text) return false; // the generic gateway has no template support

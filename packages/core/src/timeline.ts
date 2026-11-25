@@ -126,6 +126,14 @@ function pass(input: TimelineInput): TimelineResult {
       });
     });
 
+  // A skip is final once the flow has moved past it: a later stage was reached, or the record is
+  // finished. Otherwise editing a field could re-activate an earlier stage, push the current stage
+  // back to "waiting" and wipe its plan — silently, with no event (the old "stage regression").
+  // Legacy FMS behaved the same way: conditional stages were decided once, when reached.
+  const prevStatuses = input.stages.map((s) => prevByKey.get(s.key)?.status);
+  const finished = (input.previous?.length ?? 0) > 0 && prevStatuses.every((st) => st === 'done' || st === 'skipped');
+  const movedPast = (index: number) => finished || prevStatuses.slice(index + 1).some((st) => st === 'active' || st === 'done');
+
   input.stages.forEach((stage, index) => {
     const prev = prevByKey.get(stage.key);
     const prevStatus = prev?.status;
@@ -141,7 +149,7 @@ function pass(input: TimelineInput): TimelineResult {
       // Not reached yet. Keep historic actuals, drop speculative plans.
       status = actualAt ? 'done' : 'waiting';
       if (!actualAt) plannedAt = null;
-    } else if (!actualAt && (!stageApplies(stage, input.data) || jumpedOver(index))) {
+    } else if (!actualAt && (!stageApplies(stage, input.data) || jumpedOver(index) || (prevStatus === 'skipped' && movedPast(index)))) {
       status = 'skipped';
       plannedAt = null;
     } else {

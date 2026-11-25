@@ -1,12 +1,13 @@
+import { useQuery } from '@tanstack/react-query';
 import { Download } from 'lucide-react';
 import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { toast } from 'sonner';
-import { Badge, Button, Card, EmptyState, ErrorNote, PageHeader, Spinner } from '../components/ui';
-import { download } from '../lib/api';
+import { Badge, Button, Card, EmptyState, ErrorNote, PageHeader, Select, Spinner } from '../components/ui';
+import { api, download } from '../lib/api';
 import { fmtDateTime, fmtHours } from '../lib/format';
 import { usePending, useSummary, useWorkflow } from '../lib/queries';
-import type { StageSummaryRow } from '../lib/types';
+import type { StageSummaryRow, WorkflowView } from '../lib/types';
 
 /** Segments carry *status*, so they use the reserved status tokens and always ship with a legend + table. */
 const SEGMENTS = [
@@ -31,7 +32,7 @@ export default function Reports() {
     <div className="mx-auto max-w-6xl space-y-4">
       <PageHeader
         title={`${wf.name} — Reports`}
-        subtitle={summary.data ? `${summary.data.totalRecords} active records · updated ${fmtDateTime(summary.data.generatedAt)}` : ' '}
+        subtitle={summary.data ? `${summary.data.totalRecords} active records · updated ${fmtDateTime(summary.data.generatedAt, wf.timezone)}` : ' '}
         actions={
           wf.canExport && (
             <Button icon={<Download className="size-4" />} onClick={() => download(`/workflows/${wf.key}/records/export.csv`, { status: 'overdue' }).catch((e: Error) => toast.error(e.message))}>
@@ -135,8 +136,91 @@ export default function Reports() {
           </div>
         )}
       </Card>
+
+      <MissingFieldsCard wf={wf} />
     </div>
   );
+}
+
+/** Legacy Rep_Step: which fields are still empty where each record is now. */
+function MissingFieldsCard({ wf }: { wf: WorkflowView }) {
+  const [stage, setStage] = useState('');
+  const q = useQuery({
+    queryKey: ['missing', wf.key, stage],
+    queryFn: () => api<{ items: MissingRow[]; total: number }>(`/workflows/${wf.key}/reports/missing`, { query: { stage: stage || undefined } }),
+  });
+  return (
+    <Card
+      title="Fields still empty"
+      actions={
+        <Select className="h-8 w-auto text-[13px]" aria-label="Step" value={stage} onChange={(e) => setStage(e.target.value)}>
+          <option value="">Every record’s current step</option>
+          {wf.stages.slice(1).map((s) => (
+            <option key={s.key} value={s.key}>
+              {s.name}
+            </option>
+          ))}
+        </Select>
+      }
+      bodyClassName="p-0"
+    >
+      {q.isLoading ? (
+        <Spinner />
+      ) : !q.data?.items.length ? (
+        <div className="p-4">
+          <EmptyState title="Nothing missing">Every record has its current step’s fields filled in.</EmptyState>
+        </div>
+      ) : (
+        <div className="max-h-[32rem] overflow-auto">
+          <table className="table-base">
+            <thead>
+              <tr>
+                <th>Record</th>
+                <th>Step</th>
+                <th>Still empty</th>
+              </tr>
+            </thead>
+            <tbody>
+              {q.data.items.map((r) => {
+                const st = wf.stages.find((s) => s.key === r.stageKey);
+                return (
+                  <tr key={`${r.recordId}:${r.stageKey}`}>
+                    <td className="whitespace-nowrap">
+                      <Link className="text-primary hover:underline" to={`/w/${wf.key}/records/${r.recordId}?stage=${r.stageKey}`}>
+                        #{r.recordNumber} {r.title}
+                      </Link>
+                    </td>
+                    <td>
+                      <Badge color={st?.color}>{st?.name ?? r.stageKey}</Badge>
+                    </td>
+                    <td>
+                      <span className="flex flex-wrap gap-1">
+                        {r.missing.map((m) => (
+                          <Badge key={m.key} tone={m.required ? 'danger' : 'neutral'}>
+                            {m.label}
+                            {m.required ? ' *' : ''}
+                          </Badge>
+                        ))}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {q.data.total > q.data.items.length && <p className="p-3 text-xs text-muted">Showing {q.data.items.length} of {q.data.total}.</p>}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+interface MissingRow {
+  recordId: string;
+  recordNumber: number;
+  title?: string;
+  stageKey: string;
+  missing: { key: string; label: string; required: boolean }[];
 }
 
 /** Horizontal stacked bars, one per stage, sharing one scale (the largest stage total). */

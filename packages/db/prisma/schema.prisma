@@ -38,6 +38,27 @@ model Organization {
   auditLogs   AuditLog[]
   templates   WorkflowTemplate[]
   connections Connection[]
+  dashboardTiles DashboardTile[]
+}
+
+/// Dashboard link tiles (legacy Dashboard tab / dashboard.html): reports, sheets or sites the team
+/// opens often, shown to the groups listed (empty = everyone).
+model DashboardTile {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String
+  url         String
+  description String?
+  /// One of a fixed set of icon names (chart, sheet, doc, link, …).
+  icon        String   @default("link")
+  groups      String[] @default([])
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, position])
 }
 
 /// Replaces Settings!X:AC. Passwords are argon2id hashes, never plaintext.
@@ -256,6 +277,10 @@ model WorkflowVersion {
   version     Int
   definition  Json
   settings    Json
+  /// Node-editor layout at this version (null for versions saved before it was kept, or by the form editor).
+  canvas      Json?
+  /// How the version came about: created | saved | published | form_editor | restored:<n>.
+  note        String?
   createdById String?
   createdAt   DateTime @default(now())
 

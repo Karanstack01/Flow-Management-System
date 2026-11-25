@@ -5,7 +5,7 @@
  */
 import clsx from 'clsx';
 import { ChevronDown, Copy, ExternalLink, Eye, FileText, Globe, Lock, MessageCircle, PencilLine, Trash2, UserPlus, Users } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import { type ConditionGroup, type DocumentConfig, type FieldDef, type StageDef, type WorkflowDef } from '@fms/core';
 import { ConditionEditor } from '../../../components/ConditionEditor';
@@ -60,16 +60,19 @@ const Label = ({ children, hint }: { children: ReactNode; hint?: ReactNode }) =>
   </div>
 );
 
-/** A labelled on/off row in a soft box. */
-function ToggleRow({ title, hint, icon, checked, onChange, disabled }: { title: string; hint: string; icon?: ReactNode; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+/** A labelled on/off row in a soft box; `children` (e.g. "how many hours") show while it is on. */
+export function ToggleRow({ title, hint, icon, checked, onChange, disabled, children }: { title: string; hint: string; icon?: ReactNode; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; children?: ReactNode }) {
   return (
-    <div className={clsx('flex items-start gap-3 rounded-xl border border-line bg-surface px-3 py-2.5', disabled && 'opacity-60')}>
-      {icon && <span className="mt-0.5 shrink-0 text-muted [&>svg]:size-4">{icon}</span>}
-      <span className="min-w-0 flex-1">
-        <span className="block text-[13px] font-medium">{title}</span>
-        <span className="block text-[11px] leading-snug text-muted">{hint}</span>
-      </span>
-      <Switch checked={checked} onChange={onChange} label={title} disabled={disabled} />
+    <div className={clsx('rounded-xl border border-line bg-surface px-3 py-2.5 transition-colors duration-200', disabled && 'opacity-60')}>
+      <div className="flex items-start gap-3">
+        {icon && <span className="mt-0.5 shrink-0 text-muted [&>svg]:size-4">{icon}</span>}
+        <span className="min-w-0 flex-1">
+          <span className="block text-[13px] font-medium">{title}</span>
+          <span className="block text-[11px] leading-snug text-muted">{hint}</span>
+        </span>
+        <Switch checked={checked} onChange={onChange} label={title} disabled={disabled} />
+      </div>
+      {children && checked && <div className={clsx('mt-2.5 animate-pop-in border-t border-dashed border-line pt-2.5', icon && 'pl-7')}>{children}</div>}
     </div>
   );
 }
@@ -77,6 +80,11 @@ function ToggleRow({ title, hint, icon, checked, onChange, disabled }: { title: 
 /** Stage header colour for the All Entries table (optional). */
 function HeaderColor({ value, onChange }: { value?: string; onChange: (v: string | undefined) => void }) {
   const [text, setText] = useState(value ?? '');
+  // Follow outside changes (undo / redo); half-typed text that is not a colour yet is kept.
+  useEffect(() => {
+    if ((value ?? '') !== text.toLowerCase()) setText(value ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when the stored value changes
+  }, [value]);
   return (
     <div>
       <Label hint="Choose a colour for this stage’s column headers in the entries table.">Stage header colour (All Entries table)</Label>
@@ -175,6 +183,18 @@ function VideoSetting({ value, onChange }: { value?: StageDef['video']; onChange
   const [title, setTitle] = useState(value?.title ?? '');
   const [url, setUrl] = useState(value?.url ?? '');
   const valid = /^https:\/\/[^\s]+\.[^\s]+/i.test(url.trim());
+  // Follow outside changes (undo / redo). While a link is being typed (not valid yet) the stage has
+  // no video, so only a stored value that differs from what is typed replaces the inputs.
+  useEffect(() => {
+    if (value && (value.url !== url.trim() || (value.title ?? '') !== title.trim())) {
+      setUrl(value.url);
+      setTitle(value.title ?? '');
+    } else if (!value && valid) {
+      setUrl('');
+      setTitle('');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when the stored value changes
+  }, [value?.url, value?.title]);
   const commit = (t: string, u: string) => onChange(/^https:\/\/[^\s]+\.[^\s]+/i.test(u.trim()) ? { title: t.trim() || undefined, url: u.trim() } : undefined);
   return (
     <div>
@@ -235,7 +255,7 @@ export function StageGeneral({ stage, def, isIntake, groups, users, keyLocked, w
               <Globe className="size-4 text-success" />
               <p className="flex-1 text-[14px] font-semibold">Public Form Access</p>
               <label className="inline-flex cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" className="size-4 accent-[var(--color-success)]" checked={!!stage.publicForm} onChange={(e) => onStage(e.target.checked ? { publicForm: true, publicFormId: stage.publicFormId ?? newPublicId() } : { publicForm: undefined })} />
+                <input type="checkbox" className="mt-0.5" checked={!!stage.publicForm} onChange={(e) => onStage(e.target.checked ? { publicForm: true, publicFormId: stage.publicFormId ?? newPublicId() } : { publicForm: undefined })} />
                 Allow public access
               </label>
             </div>
@@ -250,8 +270,15 @@ export function StageGeneral({ stage, def, isIntake, groups, users, keyLocked, w
                     <ExternalLink className="size-4" />
                   </a>
                 </div>
+                <button
+                  type="button"
+                  className="text-[11px] font-medium text-info hover:underline"
+                  onClick={() => window.confirm('Create a new link? The current link stops working once you save.') && onStage({ publicFormId: newPublicId() })}
+                >
+                  New link (retire the current one)
+                </button>
                 <p className="text-[11px] text-muted">
-                  Anyone with the link can submit once the flow is saved and live — no sign-in. It shows the fields everyone may edit ({publicFields.length}: {publicFields.map((f) => f.label).join(', ') || 'none yet'}). File uploads are not offered publicly.
+                  Anyone with the link can submit once the flow is saved and live — no sign-in. Switching access off and on again brings back the same link. It shows the fields everyone may edit ({publicFields.length}: {publicFields.map((f) => f.label).join(', ') || 'none yet'}). File uploads are not offered publicly.
                 </p>
               </div>
             )}
@@ -261,7 +288,7 @@ export function StageGeneral({ stage, def, isIntake, groups, users, keyLocked, w
           <ToggleRow
             icon={<Users />}
             title="Allow only assigned users"
-            hint="Only these people (and admins) see this stage’s fields. Editors can fill them in and complete the stage; Viewers can only see them."
+            hint="Only these people (and admins) see this stage’s fields. Editors work on it — they are notified, see it in My Tasks and complete it (they replace the owner groups); Viewers can only see it."
             checked={!!stage.stageAccessRestricted}
             onChange={(v) => onStage({ stageAccessRestricted: v || undefined })}
           />
@@ -273,7 +300,7 @@ export function StageGeneral({ stage, def, isIntake, groups, users, keyLocked, w
 
       <Panel title="Owners & completion" defaultOpen={!isIntake}>
         <div>
-          <Label hint="Notified when it starts; it appears in their My Tasks.">Owners</Label>
+          <Label hint={stage.stageAccessRestricted ? 'Stage Access Control is on: its assigned Editors work on this stage (notified, My Tasks, Mark done) instead of these groups.' : 'Notified when it starts; it appears in their My Tasks.'}>Owners</Label>
           <div className="flex flex-wrap gap-1.5">
             {groups.map((g) => {
               const on = stage.responsibleGroups.includes(g);

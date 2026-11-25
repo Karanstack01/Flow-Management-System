@@ -3,15 +3,20 @@ import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { OnTimeMeter, TeamBars, TrendChart } from '../components/charts';
 import { CreateFlowDialog } from '../components/CreateFlowDialog';
+import { DashboardTiles } from '../components/DashboardTiles';
 import { Badge, Button, EmptyState, ErrorNote, Spinner } from '../components/ui';
 import { useAuth } from '../lib/auth';
 import { fmtNumber, fmtRelative } from '../lib/format';
 import { useDashboard, useMyTasks } from '../lib/queries';
 import type { DashboardData, DashboardFlow } from '../lib/types';
 
+/** Cards rise a little and gain depth on hover. */
+const lift = 'transition-[transform,box-shadow,border-color] duration-300 ease-[var(--ease-apple)] hover:-translate-y-0.5 hover:border-line hover:shadow-[var(--shadow-float)]';
+
 /**
- * Flows dashboard. Glass cards float over a soft colour wash; numbers first, then trend and
- * on-time performance, then where the work sits (teams, flows) and what just happened.
+ * Flows dashboard, on the app's own card surfaces (same as every other page, in light and dark):
+ * numbers first, then trend and on-time performance, then where the work sits (teams, flows) and
+ * what just happened.
  */
 export default function Dashboard() {
   const { user, can } = useAuth();
@@ -23,22 +28,15 @@ export default function Dashboard() {
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
 
   return (
-    <div className="relative mx-auto max-w-7xl">
-      {/* Colour wash behind the glass (decorative). */}
-      <div className="pointer-events-none absolute inset-x-0 -top-6 -z-0 h-[560px] overflow-hidden" aria-hidden>
-        <div className="absolute -left-24 -top-24 size-[420px] rounded-full bg-[#2a78d6]/20 blur-3xl dark:bg-[#3987e5]/15" />
-        <div className="absolute right-0 top-10 size-[380px] rounded-full bg-[#6250d6]/15 blur-3xl dark:bg-[#9085e9]/12" />
-        <div className="absolute left-1/3 top-56 size-[360px] rounded-full bg-[#1baf7a]/12 blur-3xl dark:bg-[#199e70]/10" />
-      </div>
-
-      <div className="relative">
-        <section className="glass-card mb-5 flex flex-wrap items-center gap-4 p-6">
+    <div className="mx-auto max-w-7xl">
+      <div>
+        <section className="card relative mb-5 flex flex-wrap items-center gap-4 overflow-hidden bg-[linear-gradient(120deg,var(--color-surface)_45%,var(--color-surface-2)_100%)] p-6">
           <div className="min-w-0 flex-1">
             <p className="text-[13px] font-medium text-muted">{greeting},</p>
             <h1 className="text-[28px] font-semibold leading-tight">{user?.name?.split(' ')[0]}</h1>
             <p className="mt-1 text-[15px] text-muted">Here is how every flow in {user?.org.name} is moving.</p>
           </div>
-          <Link to="/tasks" className="flex items-center gap-3 rounded-2xl bg-surface/70 px-4 py-3 ring-1 ring-line/60 transition-[transform,box-shadow] duration-200 ease-[var(--ease-apple)] hover:-translate-y-0.5 hover:shadow-[var(--shadow-float)]">
+          <Link to="/tasks" className="group flex items-center gap-3 rounded-2xl border border-line/80 bg-surface px-4 py-3 shadow-[var(--shadow-soft)] transition-[transform,box-shadow,border-color] duration-300 ease-[var(--ease-apple)] hover:-translate-y-0.5 hover:border-line hover:shadow-[var(--shadow-float)]">
             <span className="grid size-10 place-items-center rounded-full bg-primary text-primary-fg">
               <ClipboardList className="size-5 stroke-[1.75]" />
             </span>
@@ -53,7 +51,7 @@ export default function Dashboard() {
                 )}
               </span>
             </span>
-            <ArrowUpRight className="size-4 text-muted" />
+            <ArrowUpRight className="size-4 text-muted transition-transform duration-300 ease-[var(--ease-apple)] group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-fg" />
           </Link>
           {can('ADMIN') && (
             <Button variant="primary" icon={<PlusCircle className="size-4" />} onClick={() => setCreate(true)}>
@@ -140,6 +138,8 @@ function Body({ data }: { data: DashboardData }) {
         )}
       </div>
 
+      <DashboardTiles />
+
       <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-[0.12em] text-muted">Flows</h2>
       {flows.length === 0 ? (
         <EmptyState title="No flows yet">{can('ADMIN') ? 'Create one, or start from a template.' : 'Ask an administrator to set one up.'}</EmptyState>
@@ -160,9 +160,9 @@ const actionText = (action: string) =>
 
 function Panel({ icon, title, subtitle, children, className }: { icon: ReactNode; title: string; subtitle?: string; children: ReactNode; className?: string }) {
   return (
-    <section className={`glass-card flex flex-col p-5 ${className ?? ''}`}>
+    <section className={`card flex flex-col p-5 ${className ?? ''}`}>
       <header className="mb-4 flex items-start gap-3">
-        <span className="grid size-8 shrink-0 place-items-center rounded-xl bg-surface-2/80 text-fg [&>svg]:size-4 [&>svg]:stroke-[1.75]">{icon}</span>
+        <span className="grid size-8 shrink-0 place-items-center rounded-xl bg-surface-2 text-fg [&>svg]:size-4 [&>svg]:stroke-[1.75]">{icon}</span>
         <div className="min-w-0">
           <h2 className="text-[15px] font-semibold">{title}</h2>
           {subtitle && <p className="truncate text-xs text-muted">{subtitle}</p>}
@@ -175,9 +175,9 @@ function Panel({ icon, title, subtitle, children, className }: { icon: ReactNode
 
 function Tile({ icon, label, value, note, danger }: { icon: ReactNode; label: string; value: number; note?: string; danger?: boolean }) {
   return (
-    <div className="glass-card p-4 transition-transform duration-200 ease-[var(--ease-apple)] hover:-translate-y-0.5">
-      <div className="mb-3 flex items-center gap-2 text-[13px] text-muted [&>svg]:size-4 [&>svg]:stroke-[1.75]">
-        {icon}
+    <div className={`card p-4 ${lift}`}>
+      <div className="mb-3 flex items-center gap-2 text-[13px] text-muted">
+        <span className={`grid size-7 place-items-center rounded-lg [&>svg]:size-4 [&>svg]:stroke-[1.75] ${danger ? 'bg-danger-soft text-danger' : 'bg-surface-2 text-fg'}`}>{icon}</span>
         {label}
       </div>
       <p className={danger ? 'text-[32px] font-semibold leading-none text-danger' : 'text-[32px] font-semibold leading-none'}>{fmtNumber(value)}</p>
@@ -194,7 +194,7 @@ function FlowCard({ flow: f }: { flow: DashboardFlow }) {
   const total = withOpen.reduce((s, x) => s + x.active, 0);
   const hovered = f.stages.find((s) => s.key === hover);
   return (
-    <article className="glass-card p-5 transition-[transform,box-shadow] duration-200 ease-[var(--ease-apple)] hover:-translate-y-0.5">
+    <article className={`card p-5 ${lift}`}>
       <div className="mb-4 flex flex-wrap items-start gap-2">
         <div className="min-w-0 flex-1">
           <Link to={f.status === 'draft' ? `/flows/${f.key}/editor` : `/w/${f.key}`} className="font-semibold hover:underline">

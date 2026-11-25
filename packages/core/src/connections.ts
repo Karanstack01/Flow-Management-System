@@ -4,16 +4,18 @@
  *   storage   cloudinary            uploaded attachments
  *   email     google | microsoft    outgoing mail (one active at a time — the switch)
  *   whatsapp  redlava               official WhatsApp Business messages
+ *   ai        anthropic             AI reports (Claude)
+ *   sheets    gsheets               export records to a Google Sheet (service account)
  *
  * Non-secret settings (`config`) and secrets are validated separately: secrets are
  * stored encrypted and never sent back to the browser.
  */
 import { z } from 'zod';
 
-export const CONNECTION_KINDS = ['storage', 'email', 'whatsapp'] as const;
+export const CONNECTION_KINDS = ['storage', 'email', 'whatsapp', 'ai', 'sheets'] as const;
 export type ConnectionKind = (typeof CONNECTION_KINDS)[number];
 
-export const CONNECTION_PROVIDERS = ['cloudinary', 'google', 'microsoft', 'redlava'] as const;
+export const CONNECTION_PROVIDERS = ['cloudinary', 'google', 'microsoft', 'redlava', 'anthropic', 'gsheets'] as const;
 export type ConnectionProvider = (typeof CONNECTION_PROVIDERS)[number];
 
 export const PROVIDER_KIND: Record<ConnectionProvider, ConnectionKind> = {
@@ -21,6 +23,8 @@ export const PROVIDER_KIND: Record<ConnectionProvider, ConnectionKind> = {
   google: 'email',
   microsoft: 'email',
   redlava: 'whatsapp',
+  anthropic: 'ai',
+  gsheets: 'sheets',
 };
 
 const httpsUrl = z
@@ -109,11 +113,38 @@ export function normalizeWhatsAppNumber(raw: string, defaultCountryCode?: string
 }
 export const redlavaSecretsSchema = z.object({ apiKey: z.string().trim().min(8, 'API key looks too short').max(512) });
 
+// ------------------------------------------------------------------ Anthropic (Claude, for AI reports)
+export const AI_MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'] as const;
+export const anthropicConfigSchema = z.object({
+  model: z.enum(AI_MODELS).default('claude-opus-5-5'),
+  /** How hard the model thinks (depth vs. cost and time). */
+  effort: z.enum(['low', 'medium', 'high']).default('medium'),
+});
+export const anthropicSecretsSchema = z.object({ apiKey: z.string().trim().regex(/^sk-ant-[\w-]{20,}$/, 'An Anthropic API key starts with sk-ant-') });
+
+// ------------------------------------------------------------------ Google Sheets (service account)
+export const gsheetsConfigSchema = z.object({
+  /** The service account's email: share each target sheet with it as Editor. */
+  clientEmail: z.string().trim().email().refine((e) => e.endsWith('.iam.gserviceaccount.com'), 'A service account email ends with .iam.gserviceaccount.com'),
+});
+export const gsheetsSecretsSchema = z.object({
+  privateKey: z
+    .string()
+    // Pasted from the JSON key file (escaped \n) or into a one-line box (line breaks lost): rebuild the PEM.
+    .transform((k) => {
+      const body = /-----BEGIN PRIVATE KEY-----([\s\S]*?)-----END PRIVATE KEY-----/.exec(k.replace(/\\n/g, '\n'))?.[1]?.replace(/\s+/g, '');
+      return body ? `-----BEGIN PRIVATE KEY-----\n${body.match(/.{1,64}/g)!.join('\n')}\n-----END PRIVATE KEY-----` : k.trim();
+    })
+    .pipe(z.string().regex(/^-----BEGIN PRIVATE KEY-----[\s\S]+-----END PRIVATE KEY-----$/, 'Paste the private_key value from the service account JSON key')),
+});
+
 export const CONNECTION_SPECS = {
   cloudinary: { kind: 'storage', label: 'Cloudinary', config: cloudinaryConfigSchema, secrets: cloudinarySecretsSchema, secretFields: ['apiSecret'] },
   google: { kind: 'email', label: 'Google', config: googleConfigSchema, secrets: googleSecretsSchema, secretFields: ['appPassword'] },
   microsoft: { kind: 'email', label: 'Microsoft', config: microsoftConfigSchema, secrets: microsoftSecretsSchema, secretFields: ['clientSecret', 'appPassword'] },
   redlava: { kind: 'whatsapp', label: 'RedLava WhatsApp', config: redlavaConfigSchema, secrets: redlavaSecretsSchema, secretFields: ['apiKey'] },
+  anthropic: { kind: 'ai', label: 'Anthropic (Claude)', config: anthropicConfigSchema, secrets: anthropicSecretsSchema, secretFields: ['apiKey'] },
+  gsheets: { kind: 'sheets', label: 'Google Sheets', config: gsheetsConfigSchema, secrets: gsheetsSecretsSchema, secretFields: ['privateKey'] },
 } as const satisfies Record<ConnectionProvider, { kind: ConnectionKind; label: string; config: z.ZodTypeAny; secrets: z.ZodTypeAny; secretFields: readonly string[] }>;
 
 export type CloudinaryConfig = z.infer<typeof cloudinaryConfigSchema>;
@@ -124,12 +155,18 @@ export type MicrosoftConfig = z.infer<typeof microsoftConfigSchema>;
 export type MicrosoftSecrets = z.infer<typeof microsoftSecretsSchema>;
 export type RedlavaConfig = z.infer<typeof redlavaConfigSchema>;
 export type RedlavaSecrets = z.infer<typeof redlavaSecretsSchema>;
+export type AnthropicConfig = z.infer<typeof anthropicConfigSchema>;
+export type AnthropicSecrets = z.infer<typeof anthropicSecretsSchema>;
+export type GsheetsConfig = z.infer<typeof gsheetsConfigSchema>;
+export type GsheetsSecrets = z.infer<typeof gsheetsSecretsSchema>;
 
 export type ResolvedConnection =
   | { provider: 'cloudinary'; config: CloudinaryConfig; secrets: CloudinarySecrets }
   | { provider: 'google'; config: GoogleConfig; secrets: GoogleSecrets }
   | { provider: 'microsoft'; config: MicrosoftConfig; secrets: MicrosoftSecrets }
-  | { provider: 'redlava'; config: RedlavaConfig; secrets: RedlavaSecrets };
+  | { provider: 'redlava'; config: RedlavaConfig; secrets: RedlavaSecrets }
+  | { provider: 'anthropic'; config: AnthropicConfig; secrets: AnthropicSecrets }
+  | { provider: 'gsheets'; config: GsheetsConfig; secrets: GsheetsSecrets };
 
 export interface ConnectionIssue {
   path: string;

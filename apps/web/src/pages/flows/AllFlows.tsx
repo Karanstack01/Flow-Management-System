@@ -161,7 +161,7 @@ export default function AllFlows() {
                 <tr className="border-b-2 border-primary/30 bg-surface-2 text-left">
                   {manage && (
                     <th className="w-12 px-4 py-3">
-                      <input type="checkbox" aria-label="Select all" checked={allChecked} onChange={(e) => setSelected(e.target.checked ? new Set(items.map((f) => f.key)) : new Set())} className="size-4 accent-[var(--color-primary)]" />
+                      <input type="checkbox" aria-label="Select all" checked={allChecked} onChange={(e) => setSelected(e.target.checked ? new Set(items.map((f) => f.key)) : new Set())} />
                     </th>
                   )}
                   <th className="px-3 py-3 font-semibold">Actions</th>
@@ -189,7 +189,6 @@ export default function AllFlows() {
                             else next.delete(f.key);
                             setSelected(next);
                           }}
-                          className="size-4 accent-[var(--color-primary)]"
                         />
                       </td>
                     )}

@@ -18,3 +18,6 @@ export type Tx = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$trans
 export * from './secrets.js';
 export * from './connections.js';
 export * from './net.js';
+export * from './files.js';
+export * from './ai.js';
+export * from './sheets.js';

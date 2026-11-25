@@ -5,7 +5,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { CONNECTION_PROVIDERS, CONNECTION_SPECS, PROVIDER_KIND, maskSecret, validateConnection, type ConnectionProvider, type ResolvedConnection } from '@fms/core';
-import { cloudinaryDestroy, cloudinaryFetch, cloudinaryPing, cloudinaryUpload, decryptJson, encryptJson, prisma, Prisma, sendMail, sendWhatsApp } from '@fms/db';
+import { askClaude, checkSheet, cloudinaryDestroy, cloudinaryFetch, cloudinaryPing, cloudinaryUpload, decryptJson, encryptJson, prisma, Prisma, sendMail, sendWhatsApp } from '@fms/db';
 import { audit } from '../lib/audit.js';
 import { AppError, parse } from '../lib/errors.js';
 
@@ -146,6 +146,13 @@ export default async function connectionRoutes(app: FastifyInstance) {
           text: `This is a test from ${CONNECTION_SPECS[conn.provider].label} in your Flow Management System connection settings.`,
         });
         message = `Test email sent to ${to.data}.`;
+      } else if (conn.provider === 'anthropic') {
+        // A tiny real request: proves the key, the model and the account's access in one go.
+        const a = await askClaude({ ...conn, config: { ...conn.config, effort: 'low' } }, { system: 'You check connections. Reply with exactly: OK', prompt: 'Connection test', maxTokens: 64 });
+        message = `Claude answered (${a.model}). AI reports can use this connection.`;
+      } else if (conn.provider === 'gsheets') {
+        // Optional: a spreadsheet link in "to" checks that it has been shared with the account.
+        message = await checkSheet(conn, body.to || undefined);
       } else {
         if (!body.to) throw AppError.validation({ to: 'Enter a WhatsApp number to send the test to' });
         const r = await sendWhatsApp(conn, body.to, body.template ? { template: { name: body.template, language: body.language || undefined, params: [] } } : { text: 'Test message from your Flow Management System.' });

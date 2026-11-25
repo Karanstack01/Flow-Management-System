@@ -44,6 +44,9 @@ export interface MailMessage {
   subject: string;
   html: string;
   text: string;
+  /** Sender name for this message (the address stays the connection's). */
+  fromName?: string;
+  attachments?: { filename: string; contentType: string; content: Buffer }[];
 }
 
 const graphTokens = new Map<string, { token: string; expires: number }>();
@@ -75,7 +78,15 @@ export async function sendMail(conn: ResolvedConnection, msg: MailMessage): Prom
         ? { host: 'smtp.gmail.com', port: 465, secure: true, auth: { user: conn.config.email, pass } }
         : { host: 'smtp.office365.com', port: 587, secure: false, requireTLS: true, auth: { user: conn.config.email, pass } },
     );
-    await transport.sendMail({ from: fromHeader(conn.config.email, conn.config.fromName), to: msg.to, cc: msg.cc?.length ? msg.cc : undefined, subject: msg.subject, html: msg.html, text: msg.text });
+    await transport.sendMail({
+      from: fromHeader(conn.config.email, msg.fromName || conn.config.fromName),
+      to: msg.to,
+      cc: msg.cc?.length ? msg.cc : undefined,
+      subject: msg.subject,
+      html: msg.html,
+      text: msg.text,
+      attachments: msg.attachments?.map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType })),
+    });
     return;
   }
   if (conn.provider === 'microsoft') {
@@ -89,6 +100,10 @@ export async function sendMail(conn: ResolvedConnection, msg: MailMessage): Prom
           body: { contentType: 'HTML', content: msg.html },
           toRecipients: msg.to.map((address) => ({ emailAddress: { address } })),
           ccRecipients: (msg.cc ?? []).map((address) => ({ emailAddress: { address } })),
+          ...(msg.fromName ? { from: { emailAddress: { address: conn.config.email, name: msg.fromName } } } : {}),
+          ...(msg.attachments?.length
+            ? { attachments: msg.attachments.map((a) => ({ '@odata.type': '#microsoft.graph.fileAttachment', name: a.filename, contentType: a.contentType, contentBytes: a.content.toString('base64') })) }
+            : {}),
         },
         saveToSentItems: true,
       }),

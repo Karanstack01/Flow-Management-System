@@ -14,21 +14,25 @@ import {
   useNodesInitialized,
   useNodesState,
   useReactFlow,
+  useStore,
+  ViewportPortal,
   type Connection,
   type Edge,
+  type NodeChange,
 } from '@xyflow/react';
 import clsx from 'clsx';
-import { ArrowLeft, Check, ChevronLeft, CircleAlert, CircleCheck, LayoutGrid, Maximize2, Pencil, Redo2, Rocket, Save, SlidersHorizontal, TriangleAlert, Undo2, X } from 'lucide-react';
+import { ArrowLeft, Check, ChevronLeft, CircleAlert, CircleCheck, History, LayoutGrid, Maximize2, Pencil, Redo2, Rocket, Save, SlidersHorizontal, TriangleAlert, Undo2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
-import { compileCanvas, conditionCases, ELSE_HANDLE, isStageNode, layoutCanvas, type Canvas, type CanvasNodeType, type ConditionNodeData, type FieldDef, type StageDef, type WorkflowDef, type WorkflowSettings } from '@fms/core';
+import { compileCanvas, conditionCases, ELSE_HANDLE, isStageNode, layoutCanvas, reconcileCanvas, type Canvas, type CanvasNodeType, type ConditionNodeData, type FieldDef, type StageDef, type WorkflowDef, type WorkflowSettings } from '@fms/core';
 import { Badge, Button, ErrorNote, Select, Spinner } from '../../../components/ui';
 import { ApiError, api } from '../../../lib/api';
 import { useFlowsInvalidation } from '../../../lib/queries';
-import type { EditorData } from '../../../lib/types';
+import type { EditorData, FlowVersion } from '../../../lib/types';
 import { Inspector } from './Inspector';
 import { StepPreview } from './Preview';
+import { VersionHistory } from './VersionHistory';
 import { canStartSave, PANEL_CLOSED, panelReducer, SAVE_IDLE, saveReducer, type PanelState } from './machines';
 import { EditorContext, nodeTypes, PALETTE, TONES, type FlowNode } from './nodes';
 
@@ -89,6 +93,63 @@ const toCanvas = (nodes: FlowNode[], edges: Edge[]): Canvas => ({
 });
 const uid = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 
+/** Screen pixels within which a dragged step snaps into line with another step. */
+const SNAP_PX = 8;
+interface Guides {
+  x?: number;
+  y?: number;
+}
+
+/**
+ * Alignment while dragging one step: its left edge, centre or right edge (top, middle, bottom) snaps
+ * to the same line of a nearby step, and a guide line shows which.
+ */
+function alignTo(me: FlowNode, pos: { x: number; y: number }, others: FlowNode[], zoom: number): { pos: { x: number; y: number }; guides: Guides } {
+  const w = me.measured?.width ?? 240;
+  const h = me.measured?.height ?? 100;
+  const tol = SNAP_PX / Math.max(zoom, 0.1);
+  let bestX: { d: number; x: number; line: number } | null = null;
+  let bestY: { d: number; y: number; line: number } | null = null;
+  for (const o of others) {
+    const ow = o.measured?.width ?? 240;
+    const oh = o.measured?.height ?? 100;
+    // [my position that aligns, the guide line]
+    const xs: [number, number][] = [
+      [o.position.x, o.position.x],
+      [o.position.x + ow / 2 - w / 2, o.position.x + ow / 2],
+      [o.position.x + ow - w, o.position.x + ow],
+    ];
+    const ys: [number, number][] = [
+      [o.position.y, o.position.y],
+      [o.position.y + oh / 2 - h / 2, o.position.y + oh / 2],
+      [o.position.y + oh - h, o.position.y + oh],
+    ];
+    for (const [x, line] of xs) {
+      const d = Math.abs(pos.x - x);
+      if (d <= tol && (!bestX || d < bestX.d)) bestX = { d, x, line };
+    }
+    for (const [y, line] of ys) {
+      const d = Math.abs(pos.y - y);
+      if (d <= tol && (!bestY || d < bestY.d)) bestY = { d, y, line };
+    }
+  }
+  return { pos: { x: bestX?.x ?? pos.x, y: bestY?.y ?? pos.y }, guides: { x: bestX?.line, y: bestY?.line } };
+}
+
+/** Dashed guide lines in flow coordinates (inside <ReactFlow>, so they pan and zoom with it). */
+function AlignmentGuides({ guides }: { guides: Guides }) {
+  const zoom = useStore((s) => s.transform[2]);
+  if (guides.x === undefined && guides.y === undefined) return null;
+  const t = 1 / zoom;
+  const line = 'pointer-events-none absolute left-0 top-0 border-info';
+  return (
+    <ViewportPortal>
+      {guides.x !== undefined && <div className={line} style={{ transform: `translate(${guides.x}px, -50000px)`, height: 100000, borderLeftWidth: t, borderLeftStyle: 'dashed' }} />}
+      {guides.y !== undefined && <div className={line} style={{ transform: `translate(-50000px, ${guides.y}px)`, width: 100000, borderTopWidth: t, borderTopStyle: 'dashed' }} />}
+    </ViewportPortal>
+  );
+}
+
 export default function FlowEditorPage() {
   const { wf = '' } = useParams();
   const { data, error } = useQuery({ queryKey: ['editor', wf], queryFn: () => api<EditorData>(`/flows/${wf}/editor`), staleTime: Infinity, gcTime: 0 });
@@ -113,6 +174,9 @@ interface Snapshot {
   nodes: FlowNode[];
   edges: Edge[];
   def: WorkflowDef;
+  settings: WorkflowSettings;
+  /** The version restored from history, while that restore is not saved yet. */
+  restoredFrom: number | null;
 }
 
 function Editor({ initial }: { initial: EditorData }) {
@@ -129,6 +193,9 @@ function Editor({ initial }: { initial: EditorData }) {
   const [save, dispatchSave] = useReducer(saveReducer, SAVE_IDLE);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [previewId, setPreviewId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [restoredFrom, setRestoredFrom] = useState<number | null>(null);
+  const [guides, setGuides] = useState<Guides>({});
   // Settings panel width: drag its left edge, or toggle wide; remembered per browser.
   const [panelWidth, setPanelWidth] = useState(() => {
     try {
@@ -175,7 +242,7 @@ function Editor({ initial }: { initial: EditorData }) {
   const future = useRef<Snapshot[]>([]);
   const lastPush = useRef(0);
   const [, force] = useState(0);
-  const snapshot = useCallback((): Snapshot => ({ nodes, edges, def }), [nodes, edges, def]);
+  const snapshot = useCallback((): Snapshot => ({ nodes, edges, def, settings, restoredFrom }), [nodes, edges, def, settings, restoredFrom]);
   const remember = useCallback(
     (coalesce = false) => {
       dispatchSave({ type: 'EDITED' });
@@ -192,6 +259,8 @@ function Editor({ initial }: { initial: EditorData }) {
     setNodes(s.nodes);
     setEdges(s.edges);
     setDef(s.def);
+    setSettings(s.settings);
+    setRestoredFrom(s.restoredFrom);
     dispatchPanel({ type: 'REMOVED', ids: nodes.filter((n) => !s.nodes.some((m) => m.id === n.id)).map((n) => n.id) });
   };
   const undo = () => {
@@ -379,6 +448,41 @@ function Editor({ initial }: { initial: EditorData }) {
     window.setTimeout(() => void rf.fitView(FIT), 60);
   };
 
+  /** Dragging one step snaps it into line with its neighbours; several steps move freely. */
+  const onNodesChangeAligned = useCallback(
+    (changes: NodeChange<FlowNode>[]) => {
+      const c = changes.length === 1 && changes[0]!.type === 'position' ? changes[0]! : null;
+      if (c?.type === 'position' && c.dragging && c.position) {
+        const all = rf.getNodes() as FlowNode[];
+        const me = all.find((n) => n.id === c.id);
+        if (me) {
+          const near = all.filter((n) => n.id !== c.id && Math.abs(n.position.x - c.position!.x) < 1600 && Math.abs(n.position.y - c.position!.y) < 1200);
+          const aligned = alignTo(me, c.position, near, rf.getZoom());
+          setGuides((g) => (g.x === aligned.guides.x && g.y === aligned.guides.y ? g : aligned.guides));
+          onNodesChange([{ ...c, position: aligned.pos }]);
+          return;
+        }
+      }
+      if (changes.some((x) => x.type === 'position' && !x.dragging)) setGuides((g) => (g.x === undefined && g.y === undefined ? g : {}));
+      onNodesChange(changes);
+    },
+    [onNodesChange, rf],
+  );
+
+  /** Version history › Restore: the old version replaces the editor contents (undoable), saved like any edit. */
+  const restoreVersion = (v: FlowVersion) => {
+    remember();
+    const layout = upgradeNodes(v.canvas ?? reconcileCanvas(canvas, v.definition, v.settings));
+    setNodes(toNodes(layout));
+    setEdges(toEdges(layout));
+    setDef(v.definition);
+    setSettings(v.settings);
+    setRestoredFrom(v.version);
+    dispatchPanel({ type: 'CLOSE' });
+    window.setTimeout(() => void rf.fitView(FIT), 80);
+    toast.success(`Version ${v.version} is in the editor`, { description: 'Review it, then Save to keep it. Undo brings back what you had.' });
+  };
+
   // ---------- inspector callbacks
   const onNodeData = (id: string, patch: Record<string, unknown>) => {
     remember(true);
@@ -421,7 +525,9 @@ function Editor({ initial }: { initial: EditorData }) {
         void doSave(false);
         return;
       }
-      if (typing) return;
+      // An open dialog (preview, large field editor) owns the keyboard: Esc closes only the dialog,
+      // and undo / delete must not change the canvas behind it.
+      if (typing || document.querySelector('dialog[open]')) return;
       if (e.key === 'Escape') closePanel();
       else if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -433,6 +539,13 @@ function Editor({ initial }: { initial: EditorData }) {
       } else if (mod && e.key === '.') {
         e.preventDefault();
         dispatchPanel({ type: 'TOGGLE_SETTINGS' });
+      } else if (e.key === 'Enter' && !mod) {
+        // Enter opens the settings of the one selected step (a click only selects).
+        const sel = nodes.filter((n) => n.selected);
+        if (sel.length === 1 && !(e.target as HTMLElement).closest('button, a')) {
+          e.preventDefault();
+          select(sel[0]!.id);
+        }
       }
     };
     window.addEventListener('keydown', onKey);
@@ -448,15 +561,25 @@ function Editor({ initial }: { initial: EditorData }) {
     }
     dispatchSave({ type: 'START', publish });
     try {
-      const r = await api<{ version: number; warnings: { message: string }[]; isDraft: boolean }>(`/flows/${initial.flow.key}/editor`, {
+      const r = await api<{ version: number; warnings: { message: string }[]; isDraft: boolean; publicFormId?: string | null }>(`/flows/${initial.flow.key}/editor`, {
         method: 'PUT',
-        body: { canvas, definition: def, settings, calendarId, publish },
+        body: { canvas, definition: def, settings, calendarId, publish, ...(restoredFrom ? { restoredFrom } : {}) },
       });
-      setSavedAt(JSON.stringify([canvas, def, settings, calendarId]));
+      // The server owns public link ids (it replaces one that clashes with another flow): adopt its id
+      // so the link shown in Stage › Public Form Access is the one that works.
+      let savedDef = def;
+      const intake = def.stages[0];
+      if (intake?.publicForm && r.publicFormId && r.publicFormId !== intake.publicFormId) {
+        savedDef = { ...def, stages: [{ ...intake, publicFormId: r.publicFormId }, ...def.stages.slice(1)] };
+        setDef(savedDef);
+      }
+      setSavedAt(JSON.stringify([canvas, savedDef, settings, calendarId]));
       setIsDraft(r.isDraft);
+      setRestoredFrom(null);
       dispatchSave({ type: 'SUCCEEDED', version: r.version, at: Date.now() });
       invalidateFlows();
       void qc.invalidateQueries({ queryKey: ['definition', initial.flow.key] });
+      void qc.invalidateQueries({ queryKey: ['flow-versions', initial.flow.key] });
       if (publish) toast.success('Flow published — it is live');
       if (r.warnings.length) toast.message(`${r.warnings.length} note${r.warnings.length === 1 ? '' : 's'}`, { description: r.warnings[0]!.message });
     } catch (e) {
@@ -488,9 +611,12 @@ function Editor({ initial }: { initial: EditorData }) {
   // Path outputs are labelled; jump links are dashed; edges touching the selected node light up and flow.
   const viewEdges = useMemo(() => {
     const byId = new Map(nodes.map((n) => [n.id, n]));
+    // The step whose settings are open, else the one selected step.
+    const picked = nodes.filter((n) => n.selected);
+    const focus = selectedId ?? (picked.length === 1 ? picked[0]!.id : null);
     return edges.map((e) => {
       const src = byId.get(e.source);
-      const hot = !!selectedId && (e.source === selectedId || e.target === selectedId);
+      const hot = !!focus && (e.source === focus || e.target === focus);
       let decorated: Edge = e;
       if (src?.type === 'condition') {
         const { cases } = conditionCases(src.data as ConditionNodeData);
@@ -513,6 +639,11 @@ function Editor({ initial }: { initial: EditorData }) {
     [def, issues, targets, select, deleteNodes],
   );
   const previewNode = previewId ? (nodes.find((n) => n.id === previewId) ?? null) : null;
+  // A preview belongs to a node that exists: deleting it (or undoing its creation) ends the preview,
+  // instead of the dialog popping up again later when an undo brings the node back.
+  useEffect(() => {
+    if (previewId && !previewNode) setPreviewId(null);
+  }, [previewId, previewNode]);
   const errorCount = compiled.errors.length;
   const warnCount = compiled.warnings.length;
   const panelOpen = panel.kind !== 'closed';
@@ -548,7 +679,7 @@ function Editor({ initial }: { initial: EditorData }) {
                 <Check className="size-3.5" /> Saved v{save.version}
               </span>
             ) : (
-              dirty && <span className="text-muted">Unsaved changes</span>
+              dirty && <span className={restoredFrom ? 'font-medium text-warning' : 'text-muted'}>{restoredFrom ? `Restored v${restoredFrom} — not saved yet` : 'Unsaved changes'}</span>
             )}
           </span>
 
@@ -570,6 +701,9 @@ function Editor({ initial }: { initial: EditorData }) {
             <Button size="sm" variant="ghost" aria-label="Fit to screen" title="Fit to screen" icon={<Maximize2 className="size-4" />} onClick={() => void rf.fitView(FIT)} />
             <Button size="sm" variant="ghost" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!past.current.length} icon={<Undo2 className="size-4" />} onClick={undo} />
             <Button size="sm" variant="ghost" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={!future.current.length} icon={<Redo2 className="size-4" />} onClick={redo} />
+            <Button size="sm" variant="ghost" title="Version history — compare and restore" icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)} className="max-lg:[&>span]:sr-only">
+              <span>History</span>
+            </Button>
             <Button
               size="sm"
               variant="ghost"
@@ -599,20 +733,23 @@ function Editor({ initial }: { initial: EditorData }) {
               nodes={nodes}
               edges={viewEdges}
               nodeTypes={nodeTypes}
-              onNodesChange={onNodesChange}
+              onNodesChange={onNodesChangeAligned}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
               isValidConnection={isValidConnection}
               onNodeDragStart={() => remember()}
+              onNodeDragStop={() => setGuides({})}
               onNodesDelete={(ns) => deleteNodes(ns.map((n) => n.id))}
               onEdgesDelete={() => remember()}
-              onNodeClick={(_, n) => dispatchPanel({ type: 'SELECT', id: n.id })}
+              // Moving or touching a step never opens its settings: a click selects it (its toolbar
+              // offers Settings), a double-click / Enter / the Settings button opens them. While the
+              // panel is already open, clicking another step switches the panel to it.
+              onNodeClick={(_, n) => panel.kind === 'node' && dispatchPanel({ type: 'SELECT', id: n.id })}
               onNodeDoubleClick={(_, n) => select(n.id, { center: true })}
               onPaneClick={closePanel}
-              onSelectionChange={({ nodes: sel }) => {
-                if (sel.length === 1) dispatchPanel({ type: 'SELECT', id: sel[0]!.id });
-                else if (sel.length === 0) dispatchPanel({ type: 'DESELECT' });
-              }}
+              selectNodesOnDrag={false}
+              nodeDragThreshold={5}
+              nodeClickDistance={5}
               deleteKeyCode={['Delete', 'Backspace']}
               defaultEdgeOptions={{ type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16 }, style: { strokeWidth: 1.5 } }}
               connectionLineType={ConnectionLineType.SmoothStep}
@@ -622,6 +759,7 @@ function Editor({ initial }: { initial: EditorData }) {
               proOptions={{ hideAttribution: true }}
             >
               <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="var(--color-line)" />
+              <AlignmentGuides guides={guides} />
               <Controls position="bottom-left" showInteractive={false} />
               <MiniMap pannable zoomable position="bottom-right" nodeBorderRadius={6} nodeColor={(n) => (isStageNode(n) ? (def.stages.find((s) => s.key === n.data.stageKey)?.color ?? '#94a3b8') : '#cbd5e1')} maskColor="rgb(0 0 0 / 0.06)" />
             </ReactFlow>
@@ -783,6 +921,7 @@ function Editor({ initial }: { initial: EditorData }) {
           onClose={() => setPreviewId(null)}
         />
       )}
+      {historyOpen && <VersionHistory flowKey={initial.flow.key} editor={{ definition: def, settings, canvas }} dirty={dirty} isDraft={isDraft} onRestore={restoreVersion} onClose={() => setHistoryOpen(false)} />}
     </EditorContext.Provider>
   );
 }

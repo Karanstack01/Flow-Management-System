@@ -138,6 +138,23 @@ export interface EditorData {
   users?: { name: string; email: string }[];
 }
 
+/** Version history row. `note`: created | saved | published | form_editor | restored:<n>. */
+export interface FlowVersionSummary {
+  version: number;
+  createdAt: string;
+  note: string | null;
+  author: { name: string; email: string } | null;
+}
+
+export interface FlowVersion extends FlowVersionSummary {
+  definition: import('@fms/core').WorkflowDef;
+  settings: import('@fms/core').WorkflowSettings;
+  /** Null for versions saved before layouts were kept, or saved from the form editor. */
+  canvas: import('@fms/core').Canvas | null;
+  /** False when the stored definition no longer passes today's checks (restore still re-checks it). */
+  valid: boolean;
+}
+
 export interface StageView {
   key: string;
   name: string;
@@ -148,6 +165,14 @@ export interface StageView {
   isMine: boolean;
   /** Stage Access Control: may this user fill in / complete the stage (default true). */
   canEdit?: boolean;
+  /** May this user see the stage's fields (default true). */
+  canView?: boolean;
+  /** May this user complete the stage while it is active (server rule; falls back to isMine). */
+  canAct?: boolean;
+  /** Restricted stage: assigned people (they replace the owner groups). */
+  assignees?: { email: string; role: 'Viewer' | 'Editor' }[];
+  /** Runs only when its conditions hold. */
+  conditional?: boolean;
   description?: string;
   video?: { title?: string; url: string };
   headerColor?: string;
@@ -182,6 +207,8 @@ export interface FieldView {
   lineItem: boolean;
   options?: string[];
   dependsOn?: string;
+  /** Label of `dependsOn` ("Choose “Country” first"). */
+  dependsOnLabel?: string;
   optionMap?: Record<string, string[]>;
   width?: number;
   helpText?: string;
@@ -204,6 +231,8 @@ export interface WorkflowView {
   canCreate: boolean;
   canArchive: boolean;
   canExport: boolean;
+  /** Records table default sort (Flow settings). */
+  defaultSort?: { by: string; dir: 'asc' | 'desc' } | null;
   stages: StageView[];
   fields: FieldView[];
 }
@@ -231,6 +260,18 @@ export interface RecordDto {
   updatedAt: string;
   version: number;
   stages: StageDto[];
+  /** Row colour from the flow's colour rules. */
+  rowColor?: { color: string; label: string | null } | null;
+}
+
+/** Footer totals of one column over the whole filtered set. */
+export interface ColumnTotals {
+  sum?: number | null;
+  avg?: number | null;
+  min?: number | null;
+  max?: number | null;
+  filled?: number;
+  unique?: number;
 }
 
 export interface RecordList {
@@ -238,7 +279,7 @@ export interface RecordList {
   total: number;
   page: number;
   pageSize: number;
-  aggregates: Record<string, { sum: number | null; avg: number | null }>;
+  aggregates: Record<string, ColumnTotals>;
 }
 
 export interface HistoryEntry {
@@ -248,6 +289,23 @@ export interface HistoryEntry {
   createdAt: string;
   fields?: Record<string, { from: unknown; to: unknown }>;
   events?: { type: string; stageKey: string }[];
+}
+
+/** GET …/records/:id/notifications (admins): one delivery of a hand-off, reminder, message or webhook. */
+export interface DeliveryLog {
+  id: string;
+  kind: string;
+  channel: string;
+  recipient: string;
+  /** pending | sent | failed | skipped */
+  status: string;
+  error: string | null;
+  attempts: number;
+  stageKey: string | null;
+  ruleName: string | null;
+  event: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface StageSummaryRow {
@@ -277,6 +335,8 @@ export interface PendingTask {
 export interface MyTask {
   workflowKey: string;
   workflowName: string;
+  /** The flow's business timezone: planned times are shown in it, like on the record page. */
+  timezone?: string;
   recordId: string;
   recordNumber: number;
   title: string;

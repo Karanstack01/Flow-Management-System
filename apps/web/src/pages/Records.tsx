@@ -1,18 +1,22 @@
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef, type RowSelectionState, type VisibilityState } from '@tanstack/react-table';
 import clsx from 'clsx';
-import { ArrowDown, ArrowUp, Archive, ArchiveRestore, Columns3, Download, Filter, Layers, Plus, Save, Search, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { ArrowDown, ArrowUp, Archive, ArchiveRestore, Columns3, FileUp, Filter, Layers, Pencil, Plus, Save, Search, Send, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { toast } from 'sonner';
-import type { ConditionGroup } from '@fms/core';
+import type { Condition, ConditionGroup } from '@fms/core';
 import { ConditionEditor } from '../components/ConditionEditor';
 import { CurrentStageBadge } from '../components/Stage';
-import { FieldInput } from '../components/FieldInput';
+import { changeWithDependents, FieldInput, FileThumb } from '../components/FieldInput';
 import { Badge, Button, EmptyState, ErrorNote, FormField, Input, Modal, PageHeader, Select, Spinner } from '../components/ui';
-import { api, download } from '../lib/api';
+import { api } from '../lib/api';
+import { useAuth } from '../lib/auth';
 import { displayValue, fmtDateTime, fmtNumber } from '../lib/format';
 import { useRecords, useRecordsInvalidation, useViews, useWorkflow, type RecordParams } from '../lib/queries';
 import type { FieldView, RecordData, RecordDto, StageView, WorkflowView } from '../lib/types';
+import { canEditCell, ColumnFilter, InlineEditor, TotalCell, type TotalKind } from './records/TableTools';
+import { ExportMenu, ImportDialog } from './records/ExportImport';
 
 const EMPTY_GROUP: ConditionGroup = { mode: 'all', conditions: [] };
 
@@ -37,11 +41,14 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
   const invalidate = useRecordsInvalidation(wf.key);
   const { data: views, refetch: refetchViews } = useViews(wf.key);
 
+  const { can } = useAuth();
+  const isAdmin = can('ADMIN');
   const params: RecordParams = {
     page: Number(sp.get('page') ?? 1),
     pageSize: Number(sp.get('size') ?? 50),
-    sort: sp.get('sort') ?? 'number',
-    dir: (sp.get('dir') as 'asc' | 'desc') ?? 'desc',
+    // The flow's default sort (Flow settings › Records table) until the user picks another.
+    sort: sp.get('sort') ?? wf.defaultSort?.by ?? 'number',
+    dir: (sp.get('dir') as 'asc' | 'desc') ?? (sp.get('sort') ? 'desc' : (wf.defaultSort?.dir ?? 'desc')),
     search: sp.get('q') ?? undefined,
     stage: sp.get('stage') ?? undefined,
     status: ['archived', 'all'].includes(sp.get('status') ?? '') ? undefined : (sp.get('status') ?? 'open'),
@@ -56,7 +63,6 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
     setSp(next, { replace: true });
   };
 
-  const { data, isFetching, error } = useRecords(wf.key, params);
   const [searchText, setSearchText] = useState(params.search ?? '');
   useEffect(() => {
     const t = setTimeout(() => searchText !== (params.search ?? '') && set({ q: searchText || null }), 350);
@@ -80,6 +86,29 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
       /* ignore */
     }
   }, [columns, wf.key]);
+  const { data, isFetching, error } = useRecords(wf.key, { ...params, cols: columns.join(',') });
+
+  // Footer totals per column (legacy count / sum / unique / average), remembered per flow.
+  const [totals, setTotals] = useState<Record<string, TotalKind>>(() => {
+    try {
+      return (JSON.parse(localStorage.getItem(`fms-totals-${wf.key}`) ?? 'null') as Record<string, TotalKind> | null) ?? {};
+    } catch {
+      return {};
+    }
+  });
+  const setTotal = (key: string, k: TotalKind) => {
+    const next = { ...totals, [key]: k };
+    setTotals(next);
+    try {
+      localStorage.setItem(`fms-totals-${wf.key}`, JSON.stringify(next));
+    } catch {
+      /* ignore */
+    }
+  };
+  const totalOf = (f: FieldView): TotalKind => totals[f.key] ?? (f.type === 'number' || f.type === 'computed' ? 'sum' : 'none');
+  const [editing, setEditing] = useState<{ id: string; key: string } | null>(null);
+  const [resendOpen, setResendOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   const filters: ConditionGroup = useMemo(() => {
     try {
@@ -90,6 +119,10 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
   }, [params.filters]);
 
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  // The selection belongs to the rows on screen: a new page, filter, sort or status starts empty, so
+  // Archive / Bulk update never act on records the user can no longer see.
+  const queryKey = sp.toString();
+  useEffect(() => setRowSelection({}), [queryKey]);
   const [filterOpen, setFilterOpen] = useState(false);
   const [colsOpen, setColsOpen] = useState(false);
   const [draftFilters, setDraftFilters] = useState<ConditionGroup>(filters);
@@ -105,7 +138,17 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
     const cols: ColumnDef<RecordDto>[] = [
       {
         id: 'select',
-        header: ({ table }) => <input type="checkbox" aria-label="Select all" checked={table.getIsAllRowsSelected()} onChange={table.getToggleAllRowsSelectedHandler()} />,
+        header: ({ table }) => (
+          <input
+            type="checkbox"
+            aria-label="Select all"
+            checked={table.getIsAllRowsSelected()}
+            ref={(el) => {
+              if (el) el.indeterminate = table.getIsSomeRowsSelected();
+            }}
+            onChange={table.getToggleAllRowsSelectedHandler()}
+          />
+        ),
         cell: ({ row }) => <input type="checkbox" aria-label={`Select #${row.original.number}`} checked={row.getIsSelected()} onChange={row.getToggleSelectedHandler()} onClick={(e) => e.stopPropagation()} />,
         size: 36,
       },
@@ -115,11 +158,27 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
     for (const key of columns) {
       const f = fieldByKey.get(key);
       if (!f) continue;
-      cols.push({ id: f.key, header: f.label, size: f.width, cell: ({ row }) => <Cell field={f} value={row.original.data[f.key]} zone={wf.timezone} /> });
+      cols.push({
+        id: f.key,
+        header: f.label,
+        size: f.width,
+        cell: ({ row }) => (
+          <FieldCell
+            wf={wf}
+            field={f}
+            record={row.original}
+            editable={canEditCell(wf, f, row.original, isAdmin)}
+            open={editing?.id === row.original.id && editing.key === f.key}
+            onOpen={() => setEditing({ id: row.original.id, key: f.key })}
+            onClose={() => setEditing(null)}
+            onSaved={invalidate}
+          />
+        ),
+      });
     }
-    cols.push({ id: 'createdAt', header: 'Created', cell: ({ row }) => <span className="whitespace-nowrap text-muted">{fmtDateTime(row.original.createdAt)}</span> });
+    cols.push({ id: 'createdAt', header: 'Created', cell: ({ row }) => <span className="whitespace-nowrap text-muted">{fmtDateTime(row.original.createdAt, wf.timezone)}</span> });
     return cols;
-  }, [columns, fieldByKey, wf.stages, wf.timezone]);
+  }, [columns, fieldByKey, wf, isAdmin, editing, invalidate]);
 
   const table = useReactTable({
     data: data?.items ?? [],
@@ -176,6 +235,14 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
     });
   }
 
+  /** Column quick filter: replaces that column's conditions in the filter group (others stay). */
+  const applyColumnFilter = (key: string, conds: Condition[]) => {
+    const rest = filters.conditions.filter((c) => c.field !== key);
+    const next: ConditionGroup = { mode: 'all', conditions: [...(filters.mode === 'all' ? rest : []), ...conds] };
+    if (filters.mode === 'any' && rest.length) toast.message('Column filters combine with “all” — the earlier “any” filters were replaced.');
+    set({ filters: next.conditions.length ? JSON.stringify(next) : null });
+  };
+
   const sortBy = (id: string) => {
     if (id === 'select' || id === 'stage') return;
     set({ sort: id, dir: params.sort === id && params.dir === 'desc' ? 'asc' : 'desc' });
@@ -188,11 +255,12 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
         subtitle={data ? `${data.total.toLocaleString()} record${data.total === 1 ? '' : 's'}` : ' '}
         actions={
           <>
-            {wf.canExport && (
-              <Button icon={<Download className="size-4" />} onClick={() => download(`/workflows/${wf.key}/records/export.csv`, { ...params, page: undefined, pageSize: undefined }).catch((e: Error) => toast.error(e.message))}>
-                Export
+            {wf.canCreate && wf.isActive && (
+              <Button icon={<FileUp className="size-4" />} onClick={() => setImportOpen(true)}>
+                Import
               </Button>
             )}
+            {wf.canExport && <ExportMenu wf={wf} query={{ ...params, page: undefined, pageSize: undefined, cols: undefined }} />}
             {wf.canCreate && wf.isActive && (
               <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => navigate(`/w/${wf.key}/new`)}>
                 New record
@@ -251,9 +319,14 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
         </Button>
       </div>
 
-      {selectedIds.length > 0 && (wf.canArchive || (bulkStages.length > 0 && !archivedView && wf.isActive)) && (
-        <div className="mb-3 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-2 text-sm">
+      {selectedIds.length > 0 && (wf.canArchive || can('MANAGE_RULES') || (bulkStages.length > 0 && !archivedView && wf.isActive)) && (
+        <div className="mb-3 flex animate-pop-in flex-wrap items-center gap-2 rounded-2xl border border-line bg-surface-2 px-3 py-2 text-sm">
           {selectedIds.length} selected
+          {can('MANAGE_RULES') && !archivedView && (
+            <Button size="sm" icon={<Send className="size-4" />} onClick={() => setResendOpen(true)}>
+              Resend message
+            </Button>
+          )}
           {bulkStages.length > 0 && !archivedView && wf.isActive && (
             <Button size="sm" variant="primary" icon={<Layers className="size-4" />} onClick={() => setBulkOpen(true)}>
               Bulk update
@@ -282,16 +355,18 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
                     const sortable = !['select', 'stage'].includes(h.column.id);
                     // Stage header colour (Stage › Basic settings) tints the columns of that stage's fields.
                     const tint = headerTint.get(h.column.id);
+                    const field = fieldByKey.get(h.column.id);
                     return (
                       <th
                         key={h.id}
                         style={{ minWidth: h.column.columnDef.size, ...(tint ? { background: tint, color: readableOn(tint) } : {}) }}
-                        className={clsx(sortable && 'cursor-pointer select-none')}
+                        className={clsx('group', sortable && 'cursor-pointer select-none')}
                         onClick={() => sortable && sortBy(h.column.id)}
                       >
                         <span className="inline-flex items-center gap-1">
                           {flexRender(h.column.columnDef.header, h.getContext())}
                           {params.sort === h.column.id && (params.dir === 'asc' ? <ArrowUp className="size-3" /> : <ArrowDown className="size-3" />)}
+                          {field && <ColumnFilter wf={wf} field={field} filters={filters} archived={archivedView} onApply={(conds) => applyColumnFilter(field.key, conds)} />}
                         </span>
                       </th>
                     );
@@ -300,20 +375,34 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
               ))}
             </thead>
             <tbody>
-              {table.getRowModel().rows.map((row) => (
-                <tr key={row.id} className="cursor-pointer hover:bg-surface-2" onClick={() => navigate(`/w/${wf.key}/records/${row.original.id}`)}>
-                  {row.getVisibleCells().map((cell) => (
-                    <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
-                  ))}
-                </tr>
-              ))}
+              {table.getRowModel().rows.map((row) => {
+                // Row colour rule (Flow settings › Records table): a soft tint and a coloured edge.
+                const tintColor = row.original.rowColor?.color;
+                return (
+                  <tr
+                    key={row.id}
+                    className="cursor-pointer hover:bg-surface-2"
+                    style={tintColor ? { background: `${tintColor}1f`, boxShadow: `inset 3px 0 0 ${tintColor}` } : undefined}
+                    title={row.original.rowColor?.label ?? undefined}
+                    onClick={() => !editing && navigate(`/w/${wf.key}/records/${row.original.id}`)}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
+                    ))}
+                  </tr>
+                );
+              })}
             </tbody>
-            {data && data.items.length > 0 && Object.keys(data.aggregates).some((k) => columns.includes(k)) && (
+            {data && data.items.length > 0 && (
               <tfoot>
                 <tr className="bg-surface-2 text-xs text-muted">
                   {table.getVisibleLeafColumns().map((c) => {
-                    const agg = data.aggregates[c.id];
-                    return <td key={c.id}>{agg ? <span title={`Average ${fmtNumber(agg.avg)}`}>Σ {fmtNumber(agg.sum)}</span> : c.id === 'number' ? 'Total' : ''}</td>;
+                    const f = fieldByKey.get(c.id);
+                    return (
+                      <td key={c.id} className="sticky bottom-0 border-t border-line bg-surface-2">
+                        {f ? <TotalCell field={f} totals={data.aggregates[c.id]} kind={totalOf(f)} onKind={(k) => setTotal(f.key, k)} /> : c.id === 'number' ? <span className="font-medium">{fmtNumber(data.total)} total</span> : ''}
+                      </td>
+                    );
                   })}
                 </tr>
               </tfoot>
@@ -379,6 +468,9 @@ function RecordsGrid({ wf }: { wf: WorkflowView }) {
       >
         <ConditionEditor fields={wf.fields.map((f) => ({ key: f.key, label: f.label, options: f.options }))} value={draftFilters} onChange={setDraftFilters} />
       </Modal>
+
+      {importOpen && <ImportDialog wf={wf} onClose={() => setImportOpen(false)} onDone={invalidate} />}
+      {resendOpen && <ResendDialog wf={wf} ids={selectedIds} onClose={() => setResendOpen(false)} onDone={invalidate} />}
 
       {bulkOpen && (
         <BulkUpdate
@@ -479,7 +571,7 @@ function BulkUpdate({ wf, stages, ids, initialStage, onClose, onDone }: { wf: Wo
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {fields.map((f) => (
               <FormField key={f.key} label={f.label} hint={f.helpText}>
-                <FieldInput field={f} value={data[f.key]} onChange={(v) => setData((d) => ({ ...d, [f.key]: v }))} zone={wf.timezone} data={data} />
+                <FieldInput field={f} value={data[f.key]} onChange={(v) => setData((d) => changeWithDependents(wf.fields, d, f.key, v))} zone={wf.timezone} data={data} />
               </FormField>
             ))}
           </div>
@@ -506,7 +598,98 @@ function BulkUpdate({ wf, stages, ids, initialStage, onClose, onDone }: { wf: Wo
   );
 }
 
+/** A field cell: double-click edits it in place when this user may (legacy inline editing). */
+function FieldCell({ wf, field, record, editable, open, onOpen, onClose, onSaved }: { wf: WorkflowView; field: FieldView; record: RecordDto; editable: boolean; open: boolean; onOpen: () => void; onClose: () => void; onSaved: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div
+      ref={ref}
+      className={clsx('group/cell relative -mx-1 rounded-md px-1', editable && 'cursor-text hover:bg-surface-2 hover:ring-1 hover:ring-line', open && 'ring-2 ring-info')}
+      title={editable ? 'Double-click to edit' : undefined}
+      onDoubleClick={(e) => {
+        if (!editable) return;
+        e.stopPropagation();
+        onOpen();
+      }}
+      onClick={(e) => open && e.stopPropagation()}
+    >
+      <Cell field={field} value={record.data[field.key]} zone={wf.timezone} />
+      {editable && <Pencil className="absolute right-0.5 top-0.5 size-3 text-muted opacity-0 transition-opacity group-hover/cell:opacity-100" aria-hidden />}
+      {open && <InlineEditor wf={wf} field={field} record={record} anchor={ref} onClose={onClose} onSaved={onSaved} />}
+    </div>
+  );
+}
+
+/** Send a message rule again to the selected records (legacy "Resend reminder"). */
+function ResendDialog({ wf, ids, onClose, onDone }: { wf: WorkflowView; ids: string[]; onClose: () => void; onDone: () => void }) {
+  const rules = useQuery({ queryKey: ['rules', wf.key], queryFn: () => api<{ items: { id: string; isActive: boolean; definition: { name: string; email?: unknown; whatsapp?: unknown } }[] }>(`/workflows/${wf.key}/rules`).then((r) => r.items) });
+  const [ruleId, setRuleId] = useState('');
+  const [busy, setBusy] = useState(false);
+  const active = rules.data?.filter((r) => r.isActive) ?? [];
+  async function submit() {
+    setBusy(true);
+    try {
+      const r = await api<{ cleared: number; records: number }>(`/workflows/${wf.key}/rules/${ruleId}/resend`, { method: 'POST', body: { recordIds: ids } });
+      toast.success(`Queued for ${r.records} record${r.records === 1 ? '' : 's'}`, { description: 'Sent again wherever the message’s condition or step still applies.' });
+      onDone();
+      onClose();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={`Resend a message — ${ids.length} record${ids.length === 1 ? '' : 's'}`}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" icon={<Send className="size-4" />} disabled={!ruleId} loading={busy} onClick={() => void submit()}>
+            Send again
+          </Button>
+        </>
+      }
+    >
+      {rules.isLoading ? (
+        <Spinner />
+      ) : active.length === 0 ? (
+        <EmptyState title="No active messages">Add one on the canvas (Message step) or on the Notification rules page.</EmptyState>
+      ) : (
+        <div className="space-y-1.5">
+          {active.map((r) => (
+            <label key={r.id} className={clsx('flex cursor-pointer items-center gap-3 rounded-xl border px-3 py-2.5 transition-colors', ruleId === r.id ? 'border-primary bg-surface-2' : 'border-line hover:bg-surface-2/60')}>
+              <input type="radio" name="rule" checked={ruleId === r.id} onChange={() => setRuleId(r.id)} />
+              <span className="min-w-0 flex-1 truncate text-sm font-medium">{r.definition.name}</span>
+              <span className="flex gap-1">
+                {!!r.definition.email && <Badge tone="primary">Email</Badge>}
+                {!!r.definition.whatsapp && <Badge tone="success">WhatsApp</Badge>}
+              </span>
+            </label>
+          ))}
+          <p className="pt-1 text-xs text-muted">Each selected record gets it again if its trigger still holds (the step is active or done, or the condition matches).</p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function Cell({ field, value, zone }: { field: FieldView; value: unknown; zone: string }) {
+  // Pictures show as thumbnails (legacy image columns); other files as a count.
+  if (field.type === 'file' && Array.isArray(value) && value.length) {
+    return (
+      <span className="flex items-center gap-1">
+        {(value as string[]).slice(0, 3).map((id) => (
+          <FileThumb key={id} id={id} size={32} />
+        ))}
+        {value.length > 3 && <span className="text-xs text-muted">+{value.length - 3}</span>}
+      </span>
+    );
+  }
   if (field.type === 'multiselect' && Array.isArray(value)) {
     return (
       <span className="flex flex-wrap gap-1">

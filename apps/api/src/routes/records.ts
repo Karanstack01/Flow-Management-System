@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { conditionGroupSchema, formatValue, hasCapability, isAdmin, visibleFieldKeys } from '@fms/core';
-import { prisma, toStageStates } from '@fms/db';
+import { conditionGroupSchema, formatValue, hasCapability, isAdmin, visibleFieldKeys, worksOnStage } from '@fms/core';
+import { loadConnection, prisma, toStageStates, writeSheet } from '@fms/db';
 import { AppError, parse } from '../lib/errors.js';
-import { aggregateSql, listSql, type ListQuery } from '../lib/record-sql.js';
+import { aggregateSql, distinctValuesSql, listSql, type ListQuery } from '../lib/record-sql.js';
+import { publishRecordChanged } from '../lib/queue.js';
 import { workflowFor } from '../lib/workflows.js';
 import type { AuthUser } from '../plugins/auth.js';
-import { bulkUpdate, completeStage, createSubmission, getRecord, regenerateDocument, getRecordHistory, setArchived, setPlannedTime, toDto, updateRecord } from '../services/records.js';
+import { addSubmissionItems, bulkUpdate, completeStage, createSubmission, importRecords, getRecord, regenerateDocument, getRecordHistory, setArchived, setPlannedTime, toDto, updateRecord } from '../services/records.js';
 import type { LoadedWorkflow } from '@fms/db';
 
 const listQuerySchema = z.object({
@@ -22,6 +23,8 @@ const listQuerySchema = z.object({
   submissionId: z.string().max(40).optional(),
   /** JSON-encoded ConditionGroup over visible fields. */
   filters: z.string().max(10_000).optional(),
+  /** Columns on screen (comma separated): they get filled / unique counts in the totals. */
+  cols: z.string().max(4000).optional(),
 });
 
 const wfParams = z.object({ wf: z.string().min(1).max(64) });
@@ -47,7 +50,7 @@ export function buildListQuery(wf: LoadedWorkflow, p: AuthUser, raw: unknown): L
   const sortField = wf.def.fields.find((f) => f.key === q.sort);
   if (!['number', 'createdAt', 'updatedAt'].includes(q.sort) && !(sortField && visible.has(sortField.key))) throw AppError.badRequest('Invalid sort');
   const visibleFields = wf.def.fields.filter((f) => visible.has(f.key));
-  const myStages = wf.def.stages.filter((s) => s.responsibleGroups.some((g) => p.groups.includes(g))).map((s) => s.key);
+  const myStages = wf.def.stages.filter((s) => worksOnStage(s, p)).map((s) => s.key);
   return {
     workflowId: wf.id,
     archived: q.archived === 'true',
@@ -63,6 +66,7 @@ export function buildListQuery(wf: LoadedWorkflow, p: AuthUser, raw: unknown): L
     limit: q.pageSize,
     offset: (q.page - 1) * q.pageSize,
     numericKeys: visibleFields.filter((f) => f.type === 'number' || f.type === 'computed').map((f) => f.key),
+    countKeys: (q.cols ?? '').split(',').map((k) => k.trim()).filter((k, i, a) => k && visible.has(k) && a.indexOf(k) === i).slice(0, 60),
     page: q.page,
     pageSize: q.pageSize,
   };
@@ -75,9 +79,11 @@ export async function runList(wf: LoadedWorkflow, p: AuthUser, query: ListQuery)
   const stages = rows.length ? await prisma.recordStage.findMany({ where: { recordId: { in: rows.map((r) => r.id) } } }) : [];
   const now = new Date();
   const a = agg[0] ?? { count: 0 };
-  const aggregates = Object.fromEntries(
-    query.numericKeys.map((k, i) => [k, { sum: a[`sum_${i}`] == null ? null : Number(a[`sum_${i}`]), avg: a[`avg_${i}`] == null ? null : Number(a[`avg_${i}`]) }]),
+  const n = (v: unknown) => (v == null ? null : Number(v));
+  const aggregates: Record<string, { sum?: number | null; avg?: number | null; min?: number | null; max?: number | null; filled?: number; unique?: number }> = Object.fromEntries(
+    query.numericKeys.map((k, i) => [k, { sum: n(a[`sum_${i}`]), avg: n(a[`avg_${i}`]), min: n(a[`min_${i}`]), max: n(a[`max_${i}`]) }]),
   );
+  for (const [i, k] of (query.countKeys ?? []).entries()) aggregates[k] = { ...aggregates[k], filled: Number(a[`filled_${i}`] ?? 0), unique: Number(a[`unique_${i}`] ?? 0) };
   return {
     items: rows.map((r) => toDto(wf, p, r, toStageStates(stages.filter((s) => s.recordId === r.id)), now)),
     total: Number(a.count ?? 0),
@@ -103,23 +109,65 @@ export default async function recordRoutes(app: FastifyInstance) {
     return { ...result, page: query.page, pageSize: query.pageSize };
   });
 
-  app.get('/workflows/:wf/records/export.csv', async (req, reply) => {
-    if (!hasCapability(req.principal, 'EXPORT')) throw AppError.forbidden('You cannot export data');
+  /** Values used in one column, most common first (column filter lists). Row filter and field access apply. */
+  app.get('/workflows/:wf/records/values', async (req) => {
     const { wf: key } = parse(wfParams, req.params);
+    const { field, archived } = parse(z.object({ field: z.string().min(1).max(64), archived: z.enum(['true', 'false']).default('false') }), req.query);
     const wf = await workflowFor(req.principal, key);
-    const base = buildListQuery(wf, req.principal, { ...(req.query as object), page: 1, pageSize: 200 });
-    const visible = visibleFieldKeys(wf.def.fields, req.principal, wf.def.stages);
+    if (!visibleFieldKeys(wf.def.fields, req.principal, wf.def.stages).has(field)) throw AppError.badRequest('Unknown field');
+    const rows = await prisma.$queryRaw<{ value: string; count: number }[]>(distinctValuesSql(wf.id, field, isAdmin(req.principal) ? null : (req.principal.rowFilter ?? null), archived === 'true'));
+    return { items: rows };
+  });
+
+  /** The filtered records as rows (header first), visible fields only — CSV and Google Sheets exports. */
+  async function exportRows(wf: LoadedWorkflow, p: AuthUser, query: unknown): Promise<unknown[][]> {
+    const base = buildListQuery(wf, p, { ...(query as object), page: 1, pageSize: 200 });
+    const visible = visibleFieldKeys(wf.def.fields, p, wf.def.stages);
     const fields = wf.def.fields.filter((f) => visible.has(f.key));
-    const lines: string[] = [['Record #', 'Current Stage', ...fields.map((f) => f.label), 'Created At'].map(csvCell).join(',')];
+    const out: unknown[][] = [['Record #', 'Current Stage', ...fields.map((f) => f.label), 'Created At']];
     const stageName = new Map(wf.def.stages.map((s) => [s.key, s.name]));
     for (let offset = 0; offset < 50_000; offset += 1000) {
       const rows = await prisma.$queryRaw<ListRow[]>(listSql({ ...base, limit: 1000, offset }));
       for (const r of rows) {
         const data = r.data as Record<string, unknown>;
-        lines.push([r.number, stageName.get(r.currentStageKey ?? '') ?? 'Completed', ...fields.map((f) => data[f.key]), r.createdAt.toISOString()].map(csvCell).join(','));
+        out.push([r.number, stageName.get(r.currentStageKey ?? '') ?? 'Completed', ...fields.map((f) => data[f.key]), r.createdAt.toISOString()]);
       }
       if (rows.length < 1000) break;
     }
+    return out;
+  }
+
+  /** Google Sheets export: what the dialog shows (is it set up, and the account to share with). */
+  app.get('/workflows/:wf/records/export-sheet', async (req) => {
+    if (!hasCapability(req.principal, 'EXPORT')) throw AppError.forbidden('You cannot export data');
+    const conn = await loadConnection(prisma, req.principal.orgId, { kind: 'sheets', activeOnly: true });
+    return conn?.provider === 'gsheets' ? { configured: true, clientEmail: conn.config.clientEmail } : { configured: false, clientEmail: null };
+  });
+
+  /** Write the filtered records into a tab of a Google Sheet shared with the service account (legacy pastedatafun). */
+  app.post('/workflows/:wf/records/export-sheet', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req) => {
+    if (!hasCapability(req.principal, 'EXPORT')) throw AppError.forbidden('You cannot export data');
+    const { wf: key } = parse(wfParams, req.params);
+    const body = parse(z.object({ url: z.string().trim().min(10).max(500), tab: z.string().trim().min(1).max(100).regex(/^[^[\]*?/\\:]+$/, 'A tab name can not contain [ ] * ? / \\ :'), query: z.record(z.string()).default({}) }), req.body);
+    const wf = await workflowFor(req.principal, key);
+    const conn = await loadConnection(prisma, req.principal.orgId, { kind: 'sheets', activeOnly: true });
+    if (conn?.provider !== 'gsheets') throw AppError.badRequest('Google Sheets is not set up — an admin can add it in Settings › Connections');
+    const rows = (await exportRows(wf, req.principal, body.query)).map((r) => r.map((v) => (typeof v === 'number' || typeof v === 'boolean' ? v : formatValue(v))));
+    let result: { url: string; rows: number };
+    try {
+      result = await writeSheet(conn, body.url, body.tab, rows);
+    } catch (e) {
+      throw new AppError(502, 'SHEETS_FAILED', (e as Error).message);
+    }
+    await prisma.auditLog.create({ data: { orgId: wf.orgId, actorId: req.principal.userId, actorEmail: req.principal.email, action: 'records.exported', entityType: 'Workflow', entityId: wf.id, diff: { rows: result.rows, to: 'google-sheets' }, ip: req.ip } });
+    return result;
+  });
+
+  app.get('/workflows/:wf/records/export.csv', async (req, reply) => {
+    if (!hasCapability(req.principal, 'EXPORT')) throw AppError.forbidden('You cannot export data');
+    const { wf: key } = parse(wfParams, req.params);
+    const wf = await workflowFor(req.principal, key);
+    const lines = (await exportRows(wf, req.principal, req.query)).map((r) => r.map(csvCell).join(','));
     await prisma.auditLog.create({ data: { orgId: wf.orgId, actorId: req.principal.userId, actorEmail: req.principal.email, action: 'records.exported', entityType: 'Workflow', entityId: wf.id, diff: { rows: lines.length - 1 }, ip: req.ip } });
     reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', `attachment; filename="${wf.key}-${new Date().toISOString().slice(0, 10)}.csv"`);
     return '﻿' + lines.join('\r\n'); // BOM so Excel opens the file as UTF-8
@@ -134,6 +182,24 @@ export default async function recordRoutes(app: FastifyInstance) {
     return { records };
   });
 
+  /** CSV import (columns already mapped to field keys in the browser). `dryRun` checks without saving. */
+  app.post('/workflows/:wf/records/import', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (req) => {
+    const { wf: key } = parse(wfParams, req.params);
+    const body = parse(z.object({ rows: z.array(z.record(z.unknown())).min(1).max(1000), dryRun: z.boolean().default(true) }), req.body);
+    const wf = await workflowFor(req.principal, key);
+    return importRecords(req.principal, wf, body.rows, { dryRun: body.dryRun }, req.ip);
+  });
+
+  /** Add line items to the record's multi-item submission (legacy EditResponse "add row"). */
+  app.post('/workflows/:wf/records/:id/items', async (req, reply) => {
+    const { wf: key, id } = parse(recParams, req.params);
+    const { items } = parse(z.object({ items: z.array(z.record(z.unknown())).min(1).max(50) }), req.body);
+    const wf = await workflowFor(req.principal, key);
+    const records = await addSubmissionItems(req.principal, wf, id, items, req.ip);
+    reply.code(201);
+    return { records };
+  });
+
   app.get('/workflows/:wf/records/:id', async (req) => {
     const { wf: key, id } = parse(recParams, req.params);
     const wf = await workflowFor(req.principal, key);
@@ -144,6 +210,69 @@ export default async function recordRoutes(app: FastifyInstance) {
     const { wf: key, id } = parse(recParams, req.params);
     const wf = await workflowFor(req.principal, key);
     return { items: await getRecordHistory(req.principal, wf, id) };
+  });
+
+  /**
+   * Deliveries for one record (admins): hand-offs, reminders, message rules and webhooks, with their
+   * status and error, matched to the stage they belong to — the record page shows them per step.
+   */
+  app.get('/workflows/:wf/records/:id/notifications', async (req) => {
+    if (!isAdmin(req.principal)) throw AppError.forbidden('Only admins can see delivery details');
+    const { wf: key, id } = parse(recParams, req.params);
+    const wf = await workflowFor(req.principal, key);
+    await getRecord(req.principal, wf, id); // same visibility as the record itself
+    const logs = await prisma.notificationLog.findMany({
+      where: { recordId: id, kind: { not: 'handoff-marker' } },
+      orderBy: { createdAt: 'desc' },
+      take: 300,
+      include: { rule: { select: { definition: true } } },
+    });
+    const stageKeys = new Set(wf.def.stages.map((s) => s.key));
+    return {
+      items: logs.map((l) => {
+        const rule = l.rule?.definition as { name?: string; trigger?: { type: string; stageKey?: string } } | undefined;
+        // handoff:<record>:<stage>[:r<n>]:<channel>:<to> · upcoming:<record>:<stage>:<time>:<channel>:<to>
+        const fromKey = /^(?:handoff|upcoming):[^:]+:([^:]+)/.exec(l.dedupeKey)?.[1];
+        const stageKey = rule?.trigger?.stageKey ?? (fromKey && stageKeys.has(fromKey) ? fromKey : null);
+        return {
+          id: l.id,
+          kind: l.kind,
+          channel: l.channel,
+          recipient: l.recipient,
+          status: l.status,
+          error: l.error,
+          attempts: l.attempts,
+          stageKey,
+          ruleName: rule?.name ?? null,
+          event: rule?.trigger?.type ?? (l.kind === 'handoff' ? 'stage_activated' : l.kind === 'upcoming' ? 'stage_due_soon' : null),
+          createdAt: l.createdAt.toISOString(),
+          updatedAt: l.updatedAt.toISOString(),
+        };
+      }),
+    };
+  });
+
+  /**
+   * Send one delivery again (admins; legacy "Resend reminder"). Forgetting it lets the next pass
+   * re-send to that recipient only — others already reached keep their own record.
+   */
+  app.post('/workflows/:wf/records/:id/notifications/:logId/resend', async (req) => {
+    if (!isAdmin(req.principal)) throw AppError.forbidden('Only admins can resend messages');
+    const { wf: key, id, logId } = parse(recParams.extend({ logId: z.string().min(1).max(40) }), req.params);
+    const wf = await workflowFor(req.principal, key);
+    await getRecord(req.principal, wf, id);
+    const log = await prisma.notificationLog.findFirst({ where: { id: logId, recordId: id } });
+    if (!log) throw AppError.notFound('Delivery');
+    if (log.kind === 'upcoming' || log.kind === 'digest' || log.kind === 'summary') throw AppError.badRequest('Reminders and digests are sent on their schedule; they can not be resent one by one');
+    await prisma.$transaction(async (tx) => {
+      await tx.notificationLog.delete({ where: { id: log.id } });
+      // A hand-off is guarded by its per-stage marker: drop it too, so the hand-off runs again.
+      const marker = /^(handoff:[^:]+:[^:]+(?::r\d+)?):/.exec(log.dedupeKey)?.[1];
+      if (log.kind === 'handoff' && marker) await tx.notificationLog.deleteMany({ where: { dedupeKey: marker } });
+    });
+    await publishRecordChanged([id]);
+    await prisma.auditLog.create({ data: { orgId: wf.orgId, actorId: req.principal.userId, actorEmail: req.principal.email, action: 'notification.resent', entityType: 'Record', entityId: id, diff: { kind: log.kind, channel: log.channel, recipient: log.recipient }, ip: req.ip } });
+    return { ok: true };
   });
 
   const updateBody = z.object({ data: z.record(z.unknown()).default({}), version: z.number().int().optional() });

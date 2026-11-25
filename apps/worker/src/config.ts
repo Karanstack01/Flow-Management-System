@@ -13,6 +13,8 @@ const schema = z.object({
   WHATSAPP_API_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
   WHATSAPP_API_TOKEN: z.string().optional(),
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(5),
+  /** The API's upload folder (shared disk / volume): needed to attach files stored on the server. */
+  UPLOAD_DIR: z.string().default('./uploads'),
 });
 
 export type WorkerConfig = z.infer<typeof schema>;

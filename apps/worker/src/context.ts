@@ -1,9 +1,9 @@
 import { DateTime } from 'luxon';
-import { canSeeRecord, type RecordData } from '@fms/core';
+import { canSeeRecord, worksOnStage, type RecordData, type StageDef } from '@fms/core';
 import { loadWorkflow, prisma, principalFromUser, type LoadedWorkflow } from '@fms/db';
 import type { Channels } from './channels.js';
 import type { WorkerConfig } from './config.js';
-import { groupMembers, type Recipient } from './notify.js';
+import { stageWorkers, type Recipient } from './notify.js';
 
 export interface Logger {
   info(obj: object, msg?: string): void;
@@ -41,10 +41,16 @@ export async function activeWorkflows(orgId?: string): Promise<LoadedWorkflow[]>
   return out;
 }
 
-/** Members of the stage's groups who are allowed to see this record (row filters respected). */
-export async function stageRecipients(wf: LoadedWorkflow, groups: readonly string[], data: RecordData): Promise<Recipient[]> {
-  const users = await groupMembers(wf.orgId, groups);
-  return users.filter((u) => canSeeRecord(principalFromUser(u, wf.orgId), data)).map((u) => ({ userId: u.id, email: u.email, phone: u.phone }));
+/**
+ * The people who work on this stage (its owner groups, or its assigned Editors when Stage Access
+ * Control is on) and are allowed to see this record (row filters respected).
+ */
+export async function stageRecipients(wf: LoadedWorkflow, stage: StageDef, data: RecordData): Promise<Recipient[]> {
+  const users = await stageWorkers(wf.orgId, [stage]);
+  return users
+    .map((u) => ({ u, p: principalFromUser(u, wf.orgId) }))
+    .filter(({ p }) => worksOnStage(stage, p) && canSeeRecord(p, data))
+    .map(({ u }) => ({ userId: u.id, email: u.email, phone: u.phone }));
 }
 
 export const recordUrl = (cfg: WorkerConfig, wf: LoadedWorkflow, recordId: string) => `${cfg.APP_URL.replace(/\/$/, '')}/w/${wf.key}/records/${recordId}`;

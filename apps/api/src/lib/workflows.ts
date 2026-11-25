@@ -1,5 +1,6 @@
-import { prisma, loadWorkflow, type LoadedWorkflow } from '@fms/db';
-import { fieldAccess, hasCapability, isAdmin, isResponsibleFor, stageAccess, type Principal } from '@fms/core';
+import { randomBytes } from 'node:crypto';
+import { prisma, Prisma, loadWorkflow, type LoadedWorkflow } from '@fms/db';
+import { canActOnStage, fieldAccess, hasCapability, isAdmin, stageAccess, worksOnStage, type Principal, type WorkflowDef } from '@fms/core';
 import { AppError } from './errors.js';
 
 const TTL_MS = 10_000;
@@ -32,6 +33,24 @@ export async function workflowFor(p: Principal & { orgId: string }, idOrKey: str
   return wf;
 }
 
+/**
+ * Public form link ids must be unique across all flows (the public route finds the flow by it).
+ * Keeps the id the editor shows when it is free, otherwise (missing, or copied from another flow
+ * through JSON) issues a new one. Private intake forms keep their id, so switching public access
+ * off and on again restores the same link — use "New link" in the editor to retire it.
+ */
+export async function ensurePublicFormId(workflowId: string | null, def: WorkflowDef): Promise<WorkflowDef> {
+  const intake = def.stages[0];
+  if (!intake?.publicForm) return def;
+  let id = intake.publicFormId;
+  if (id) {
+    const clash = await prisma.$queryRaw<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM "Workflow" WHERE "definition"->'stages'->0->>'publicFormId' = ${id} ${workflowId ? Prisma.sql`AND "id" <> ${workflowId}` : Prisma.empty}`;
+    if (clash[0]?.n) id = undefined;
+  }
+  return id ? def : { ...def, stages: [{ ...intake, publicFormId: randomBytes(18).toString('base64url') }, ...def.stages.slice(1)] };
+}
+
 export function invalidateWorkflow() {
   cache.clear();
 }
@@ -50,6 +69,14 @@ export function describeWorkflow(wf: LoadedWorkflow, p: Principal) {
     canCreate: hasCapability(p, 'CREATE'),
     canArchive: hasCapability(p, 'DELETE'),
     canExport: hasCapability(p, 'EXPORT'),
+    /** Records table default sort (Flow settings); dropped when it sorts by a field this user can not see. */
+    defaultSort: (() => {
+      const s = wf.settings.table.defaultSort;
+      if (!s) return null;
+      if (['number', 'createdAt', 'updatedAt'].includes(s.by)) return s;
+      const f = wf.def.fields.find((x) => x.key === s.by);
+      return f && fieldAccess(f, p, wf.def.stages).view ? s : null;
+    })(),
     stages: wf.def.stages.map((s, i) => {
       const access = stageAccess(s, p);
       return {
@@ -59,9 +86,18 @@ export function describeWorkflow(wf: LoadedWorkflow, p: Principal) {
         responsibleGroups: s.responsibleGroups,
         plannedMode: s.planned.mode,
         completion: s.completion.kind,
-        isMine: isResponsibleFor(s.responsibleGroups, p),
+        // Same rule as My Tasks, hand-offs and completion (assigned Editors replace groups when restricted).
+        isMine: isAdmin(p) || worksOnStage(s, p),
         /** Stage Access Control: may this user fill in / complete the stage? */
         canEdit: access.edit,
+        /** May this user see the stage's fields at all (Stage Access Control)? */
+        canView: access.view,
+        /** May this user complete the stage when it is active (same rule as the server's completion check)? */
+        canAct: canActOnStage(s, p) && access.edit,
+        /** Restricted stage: the people assigned to it (they replace the owner groups). */
+        assignees: s.stageAccessRestricted ? (s.stageUsers ?? []).map((u) => ({ email: u.email, role: u.role })) : undefined,
+        /** The stage only runs when conditions hold (Depends on / applies-when); details stay in the editor. */
+        conditional: !!(s.applicableWhen?.conditions.length || s.guards?.length),
         description: s.description,
         video: s.video,
         headerColor: s.headerColor,
@@ -88,6 +124,7 @@ export function describeWorkflow(wf: LoadedWorkflow, p: Principal) {
         lineItem: f.lineItem,
         options: wf.options.get(f.key) ?? f.options,
         dependsOn: f.dependsOn,
+        dependsOnLabel: f.dependsOn ? wf.def.fields.find((x) => x.key === f.dependsOn)?.label : undefined,
         optionMap: f.optionMap,
         width: f.width,
         helpText: f.helpText,
