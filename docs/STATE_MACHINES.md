@@ -224,3 +224,19 @@ saved). They did not follow undo / redo; they now resync when the stored value c
 Also aligned while auditing: record lists, reports and My Tasks show times in the flow's business
 timezone like the record page (they used the browser's); dates use one format; a datetime default of
 `TODAY` means the start of the day in the browser as on the server; Connections uses the shared switch.
+
+## Status (Updated 2026-11-23)
+
+| # | State Machine | Priority | Status & Refactoring Done | Where |
+|---|---|:---:|---|---|
+| 1 | **Record Stage & Rework Lifecycle** | **High** | **Fixed.** Formal transition function `canTransitionStage()`, `assertStageTransition()` with explicit transition matrix `ALLOWED_STAGE_TRANSITIONS` guarding reaches, completions, skips, reactivations, reverts, and rework loops. | `packages/core/src/timeline.ts`, `test/timeline.test.ts` |
+| 2 | **Record Overall Lifecycle** | **Medium** | **Fixed.** Explicit `RecordLifecycleStatus` (`active \| completed \| archived`) computed via `computeRecordLifecycle()`, exposed on API & web `RecordDto.status`. | `packages/core/src/timeline.ts`, `services/records.ts`, `apps/web/src/lib/types.ts` |
+| 3 | **Canvas Undo / Redo Stack** | **Medium** | **Fixed.** Dedicated `HistoryState<T>`, `historyReducer<T>`, `canUndo()`, and `canRedo()` replacing raw refs and forced re-renders. `present` mirrors the editor's current state: `remember()` marks the next change as an undo point (`PUSH`), other changes (drag frames, measuring, an undo's restore) only `REPLACE` it. Snapshots include flow settings and a pending version restore. | `editor/machines.ts`, `FlowEditor.tsx`, `test/editorMachines.test.ts` |
+| 4 | **Form Submission (Intake & Public)** | **Low** | **Fixed.** Dedicated state machine `formSubmissionReducer` (`idle -> submitting -> success \| error`) eliminating loose boolean combinations across intake and public forms. | `apps/web/src/lib/formMachine.ts`, `RecordNew.tsx`, `PublicForm.tsx`, `test/formMachine.test.ts` |
+| 5 | **Notification Delivery & Retry Backoff** | **Medium** | **Fixed.** Formalized `evaluateNotificationTransition` state machine governing `unclaimed -> pending -> sent \| failed \| skipped`, with atomic exponential backoff and crash recovery. | `apps/worker/src/notify.ts`, `test/notify.test.ts` |
+| 6 | **Brute-Force Lockout** | **Low** | **Fixed.** Encapsulated into explicit `accountSecurityStatus()`, `onLoginFailure()`, `onLoginSuccess()` state machine helper. | `apps/api/src/lib/accountSecurity.ts`, `routes/auth.ts`, `test/accountSecurity.test.ts` |
+
+New since the audit:
+
+* **Depends-on paths** (`stage.guards`, switch form) are evaluated by the same `stageApplies()` as `applicableWhen`, so they inherit #1's behaviour.
+* **Stage Jump** adds two explicit transitions to the stage machine: `pending → skipped` for stages a forward jump passes over, and `done → active` (round + 1) for the range a backward jump reopens. Backward jumps fire only on the source stage's transition to `done`, are capped at `MAX_ROUNDS = 20`, and emit `stage_reopened`, so the reopened owners are re-notified — unlike the regression in #1.

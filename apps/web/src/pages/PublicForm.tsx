@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { CheckCircle2, Copy, Plus, Trash2 } from 'lucide-react';
-import { useState, type FormEvent } from 'react';
+import { useReducer, useState, type FormEvent } from 'react';
 import { useParams } from 'react-router';
 import { staleDependents, type FieldValue } from '@fms/core';
 import { changeWithDependents, FieldInput, fieldDefaults } from '../components/FieldInput';
@@ -8,6 +8,7 @@ import { StackDroveLogo } from '../components/StackDroveLogo';
 import { StageIntro } from '../components/StageIntro';
 import { Button, ErrorNote, FormField, Spinner } from '../components/ui';
 import { api, ApiError } from '../lib/api';
+import { formSubmissionReducer, initialFormSubmissionState, isSubmitting } from '../lib/formMachine';
 import type { PublicFormView, RecordData } from '../lib/types';
 
 /**
@@ -45,25 +46,24 @@ function Form({ token, form }: { token: string; form: PublicFormView }) {
   const itemFields = form.fields.filter((f) => f.lineItem);
   const fresh = () => ({ header: fieldDefaults(headerFields, form.timezone), items: [fieldDefaults(itemFields, form.timezone)] });
   const [state, setState] = useState(fresh);
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [submitError, setSubmitError] = useState<unknown>(null);
-  const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState<{ numbers: number[]; thankYou: string | null } | null>(null);
+  const [submission, dispatchSubmission] = useReducer(
+    formSubmissionReducer<{ numbers: number[]; thankYou: string | null }>,
+    undefined,
+    initialFormSubmissionState,
+  );
+  const { errors, error: submitError, result: done } = submission;
+  const busy = isSubmitting(submission);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    setBusy(true);
-    setErrors({});
-    setSubmitError(null);
+    dispatchSubmission({ type: 'SUBMIT' });
     try {
       const r = await api<{ numbers: number[]; thankYou: string | null }>(`/public/forms/${token}`, { method: 'POST', body: { data: state.header, ...(itemFields.length ? { items: state.items } : {}) } });
-      setDone(r);
+      dispatchSubmission({ type: 'SUCCESS', result: r });
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
-      if (err instanceof ApiError && err.details) setErrors(err.details);
-      setSubmitError(err);
-    } finally {
-      setBusy(false);
+      const details = err instanceof ApiError && err.details ? err.details : undefined;
+      dispatchSubmission({ type: 'ERROR', error: err, errors: details });
     }
   }
 
@@ -76,7 +76,7 @@ function Form({ token, form }: { token: string; form: PublicFormView }) {
         <h1 className="text-xl font-semibold">{done.thankYou ? 'Thank you!' : 'Response submitted'}</h1>
         <p className="mx-auto mt-2 max-w-md whitespace-pre-wrap text-[15px] text-muted">{done.thankYou ?? 'Your response has been recorded. You can close this page.'}</p>
         <p className="mt-3 text-xs text-muted">Reference: {done.numbers.map((n) => `#${n}`).join(', ')}</p>
-        <Button className="mt-6" onClick={() => (setDone(null), setState(fresh()))}>
+        <Button className="mt-6" onClick={() => (dispatchSubmission({ type: 'RESET' }), setState(fresh()))}>
           Submit another response
         </Button>
       </div>

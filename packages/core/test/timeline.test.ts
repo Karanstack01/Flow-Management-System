@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { computeTimeline, type StageState } from '../src/index.js';
+import {
+  computeTimeline,
+  canTransitionStage,
+  assertStageTransition,
+  computeRecordLifecycle,
+  type StageState,
+} from '../src/index.js';
 import { calendar, fmt, ist, orderWorkflow } from './fixtures.js';
 
 const stages = orderWorkflow.stages;
@@ -88,5 +94,39 @@ describe('computeTimeline', () => {
     const again = computeTimeline({ stages, data: { priority: 'Urgent' }, createdAt: ist('2026-01-22T10:00'), now: ist('2026-01-22T13:00'), calendar, previous: first.states });
     expect(again.events).toEqual([]);
     expect(again.states).toEqual(first.states);
+  });
+
+  describe('canTransitionStage & assertStageTransition (Stage Lifecycle Machine)', () => {
+    it('allows valid transitions', () => {
+      expect(canTransitionStage('waiting', 'active', 'reach').allowed).toBe(true);
+      expect(canTransitionStage('waiting', 'skipped', 'skip').allowed).toBe(true);
+      expect(canTransitionStage('active', 'done', 'complete').allowed).toBe(true);
+      expect(canTransitionStage('done', 'waiting', 'reopen').allowed).toBe(true);
+      expect(canTransitionStage('skipped', 'active', 'reactivate').allowed).toBe(true);
+      expect(canTransitionStage('active', 'waiting', 'revert').allowed).toBe(true);
+    });
+
+    it('rejects invalid or illegal transitions', () => {
+      expect(canTransitionStage('waiting', 'done').allowed).toBe(false);
+      expect(canTransitionStage('done', 'skipped').allowed).toBe(false);
+      expect(canTransitionStage('skipped', 'done').allowed).toBe(false);
+      expect(() => assertStageTransition('waiting', 'done')).toThrow();
+    });
+  });
+
+  describe('computeRecordLifecycle (Record Overall Lifecycle Machine)', () => {
+    it('returns active when record has current stage and not completed/archived', () => {
+      expect(computeRecordLifecycle({ currentStageKey: 'approval', completedAt: null, archivedAt: null })).toBe('active');
+    });
+
+    it('returns completed when completedAt is set or no current stage key', () => {
+      expect(computeRecordLifecycle({ currentStageKey: null, completedAt: '2026-01-22T15:00:00Z', archivedAt: null })).toBe('completed');
+      expect(computeRecordLifecycle({ currentStageKey: null, completedAt: null, archivedAt: null })).toBe('completed');
+    });
+
+    it('returns archived when archivedAt is set, regardless of stage/completed status', () => {
+      expect(computeRecordLifecycle({ currentStageKey: 'approval', completedAt: null, archivedAt: '2026-01-22T16:00:00Z' })).toBe('archived');
+      expect(computeRecordLifecycle({ currentStageKey: null, completedAt: '2026-01-22T15:00:00Z', archivedAt: '2026-01-22T16:00:00Z' })).toBe('archived');
+    });
   });
 });

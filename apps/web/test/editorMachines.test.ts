@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { PANEL_CLOSED, SAVE_IDLE, canStartSave, panelReducer, saveReducer, type PanelEvent, type PanelState, type SaveEvent, type SaveState } from '../src/pages/flows/editor/machines';
+import {
+  PANEL_CLOSED,
+  SAVE_IDLE,
+  canRedo,
+  canStartSave,
+  canUndo,
+  historyReducer,
+  initHistory,
+  panelReducer,
+  saveReducer,
+  type HistoryEvent,
+  type PanelEvent,
+  type PanelState,
+  type SaveEvent,
+  type SaveState,
+} from '../src/pages/flows/editor/machines';
 
 const runPanel = (events: PanelEvent[], from: PanelState = PANEL_CLOSED) => events.reduce(panelReducer, from);
 const runSave = (events: SaveEvent[], from: SaveState = SAVE_IDLE) => events.reduce(saveReducer, from);
@@ -46,5 +61,77 @@ describe('editor save', () => {
     const failed = runSave([{ type: 'START', publish: false }, { type: 'FAILED', message: 'boom' }]);
     expect(failed).toEqual({ kind: 'failed', message: 'boom' });
     expect(canStartSave(failed)).toBe(true);
+  });
+});
+
+describe('editor history (undo / redo)', () => {
+  it('initializes with empty past and future', () => {
+    const h = initHistory('state-0');
+    expect(h.past).toEqual([]);
+    expect(h.present).toBe('state-0');
+    expect(h.future).toEqual([]);
+    expect(canUndo(h)).toBe(false);
+    expect(canRedo(h)).toBe(false);
+  });
+
+  it('pushes new state into past and clears future', () => {
+    const h0 = initHistory('state-0');
+    const h1 = historyReducer(h0, { type: 'PUSH', snapshot: 'state-1' });
+    expect(h1.past).toEqual(['state-0']);
+    expect(h1.present).toBe('state-1');
+    expect(canUndo(h1)).toBe(true);
+    expect(canRedo(h1)).toBe(false);
+  });
+
+  it('undoes back to previous state and redoes forward', () => {
+    let h = initHistory('state-0');
+    h = historyReducer(h, { type: 'PUSH', snapshot: 'state-1' });
+    h = historyReducer(h, { type: 'PUSH', snapshot: 'state-2' });
+
+    expect(h.present).toBe('state-2');
+    expect(canUndo(h)).toBe(true);
+
+    // Undo -> state-1
+    h = historyReducer(h, { type: 'UNDO' });
+    expect(h.present).toBe('state-1');
+    expect(h.future).toEqual(['state-2']);
+    expect(canRedo(h)).toBe(true);
+
+    // Redo -> state-2
+    h = historyReducer(h, { type: 'REDO' });
+    expect(h.present).toBe('state-2');
+    expect(h.future).toEqual([]);
+    expect(canRedo(h)).toBe(false);
+  });
+
+  it('coalesces rapid pushes when coalesce is true within debounce window', () => {
+    let h = initHistory('state-0');
+    h = historyReducer(h, { type: 'PUSH', snapshot: 'state-1' });
+    h = historyReducer(h, { type: 'PUSH', snapshot: 'state-2', coalesce: true, debounceMs: 5000 });
+    // past still has state-0, present was replaced with state-2
+    expect(h.past).toEqual(['state-0']);
+    expect(h.present).toBe('state-2');
+  });
+
+  it('REPLACE refreshes the present without adding an undo point', () => {
+    let h = initHistory('loaded');
+    h = historyReducer(h, { type: 'REPLACE', snapshot: 'measured' });
+    expect(h.present).toBe('measured');
+    expect(canUndo(h)).toBe(false);
+  });
+
+  it('follows the editor sequence: edit, drag frames, undo, undo, redo', () => {
+    let h = initHistory('s0');
+    h = historyReducer(h, { type: 'PUSH', snapshot: 's1' }); // first edit
+    h = historyReducer(h, { type: 'PUSH', snapshot: 'drag-1' }); // drag start (remember) + first frame
+    h = historyReducer(h, { type: 'REPLACE', snapshot: 'drag-end' }); // later frames
+    h = historyReducer(h, { type: 'UNDO' });
+    expect(h.present).toBe('s1');
+    h = historyReducer(h, { type: 'UNDO' });
+    expect(h.present).toBe('s0');
+    expect(canUndo(h)).toBe(false);
+    h = historyReducer(h, { type: 'REDO' });
+    h = historyReducer(h, { type: 'REDO' });
+    expect(h.present).toBe('drag-end');
   });
 });
